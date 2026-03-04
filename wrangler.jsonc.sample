@@ -1,0 +1,46 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "bilimartmonitor",
+    "main": "cf-worker/index.ts",
+    "compatibility_date": "2025-10-08",
+    "compatibility_flags": [
+        "nodejs_compat"
+    ],
+    "routes": [
+        {
+            "pattern": "your-domain.com",
+            "custom_domain": true
+        }
+    ],
+    "observability": {
+        "enabled": true
+    },
+    "containers": [
+        {
+            "class_name": "BiliMartMonitorContainer",
+            "image": "./Dockerfile.CloudFlare",
+            "max_instances": 10
+        }
+    ],
+    "durable_objects": {
+        "bindings": [
+            {
+                "class_name": "BiliMartMonitorContainer",
+                "name": "BMM_CONTAINER"
+            }
+        ]
+    },
+    "migrations": [
+        {
+            "new_sqlite_classes": [
+                "BiliMartMonitorContainer"
+            ],
+            "tag": "v1"
+        }
+    ],
+    "upload_source_maps": true
+}

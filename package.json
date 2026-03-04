@@ -1,0 +1,18 @@
+{
+    "name": "bilimartmonitor-container",
+    "private": true,
+    "scripts": {
+        "cf-typegen": "wrangler types",
+        "deploy": "wrangler deploy",
+        "dev": "wrangler dev"
+    },
+    "dependencies": {
+        "@cloudflare/containers": "0.0.30",
+        "hono": "4.11.1"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "^4.20250109.0",
+        "typescript": "5.9.3",
+        "wrangler": "4.69.0"
+    }
+}

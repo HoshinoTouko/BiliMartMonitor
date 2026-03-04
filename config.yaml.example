@@ -1,0 +1,63 @@
+# 扫描模式: latest / continue / continue_until_repeat
+scan_mode: latest
+
+# 扫描间隔(秒)
+interval: 60
+
+# 排序方式
+sort_type: TIME_DESC
+
+# 扫描价格区间 (单位: 分)
+# !注意: B站接口仅支持以下特定选项，请勿随意修改!
+# 选项: "0-2000", "2000-3000", "3000-5000", "5000-10000", "10000-20000", "20000-0"
+price_filters:
+- 3000-5000
+- 5000-10000
+- 20000-0
+- 10000-20000
+
+# 扫描折扣区间 (百分比数值，例如 "70-100" 表示 7折-原价)
+# !注意: B站接口仅支持以下特定选项，请勿随意修改!
+# 选项: "70-100", "50-70", "30-50", "0-30"
+discount_filters:
+- 50-70
+- 30-50
+- 0-30
+- 70-100
+category: '2312'
+timezone: Asia/Shanghai
+app_base_url: ""
+cloudflare_validation_enabled: false
+cloudflare_turnstile_site_key: ""
+cloudflare_turnstile_secret_key: ""
+
+# 接收系统告警的管理员 Telegram ID
+admin_telegram_ids: []
+
+# BiliSession 选择机制: round_robin(轮询) / random(随机)
+bili_session_pick_mode: round_robin
+
+# Session 报错后的冷却期(秒), 0 表示关闭冷却
+bili_session_cooldown_seconds: 60
+
+telegram:
+  enabled: false
+  notify: false
+  bot_id: "" # 机器人用户名 (例如 @BiliMartBot)
+  bot_token: YOUR_BOT_TOKEN_HERE
+  # 机器人读取消息的间隔(秒)
+  poll_interval: 10
+
+notify:
+  email:
+    enabled: false
+    smtp_server: ""
+    smtp_port: 587
+    username: ""
+    password: ""
+    to: []
+  sms:
+    enabled: false
+    provider: ""
+    api_key: ""
+    to: []

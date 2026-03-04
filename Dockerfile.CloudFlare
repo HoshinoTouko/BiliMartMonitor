@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+
+# Stage 1: Build frontend
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app/src/frontend
+# Enable pnpm
+RUN corepack enable pnpm
+COPY src/frontend/package.json src/frontend/pnpm-lock.yaml* src/frontend/pnpm-workspace.yaml* ./
+RUN pnpm install --frozen-lockfile
+COPY src/frontend/ ./
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN pnpm build
+
+# Stage 2: Final runner
+FROM python:3.11-slim AS runner
+
+# Install Node.js 20 and dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    gcc \
+    libsqlite3-dev \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy python dependencies and install
+COPY src/backend/requirements.txt ./src/backend/
+RUN pip install --no-cache-dir -r src/backend/requirements.txt
+
+# Copy backend code
+COPY src/ ./src/
+
+# Mount config and secrets at runtime via volume or bind mount:
+#   docker run -v /host/config.yaml:/app/config.yaml -v /host/.env:/app/.env ...
+
+# Copy Next.js standalone build
+# Next.js standalone folder includes its own node_modules and server.js
+COPY --from=frontend-builder /app/src/frontend/.next/standalone ./frontend/
+COPY --from=frontend-builder /app/src/frontend/.next/static ./frontend/.next/static
+COPY --from=frontend-builder /app/src/frontend/public ./frontend/public
+
+# Create startup script
+RUN echo '#!/bin/bash\n\
+    # Start FastAPI backend on port 8000\n\
+    export PYTHONPATH=/app/src\n\
+    uvicorn --app-dir /app/src backend.main:app --host 127.0.0.1 --port 8000 &\n\
+    # Wait for backend to be ready\n\
+    sleep 2\n\
+    # Start Next.js frontend on port 8080 (Cloudflare default)\n\
+    export PORT=8080\n\
+    export HOSTNAME=0.0.0.0\n\
+    cd /app/frontend && node server.js\n\
+    ' > /app/start.sh && chmod +x /app/start.sh
+
+# Provide dummy .env to prevent crashes if dotenv warns, or better, let it load normally
+# We don't need a dummy if it gracefully degrades
+
+ENV ENVIRONMENT=production
+
+EXPOSE 8080
+
+CMD ["/app/start.sh"]
