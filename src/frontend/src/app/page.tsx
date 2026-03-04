@@ -1,6 +1,7 @@
 "use client";
 import React, { useEffect, useRef, useState } from "react";
 import { useAuth } from "@/contexts/AuthContext";
+import AppFooter from "@/components/AppFooter";
 
 declare global {
   interface Window {
@@ -61,16 +62,20 @@ export default function LoginPage() {
 
   useEffect(() => {
     if (!cfEnabled || !cfSiteKey) {
-      setCfLoaded(false);
-      setCfWidgetReady(false);
-      setCfToken("");
-      return;
+      const resetId = window.setTimeout(() => {
+        setCfLoaded(false);
+        setCfWidgetReady(false);
+        setCfToken("");
+      }, 0);
+      return () => window.clearTimeout(resetId);
     }
 
     const existing = document.querySelector('script[data-bsm-turnstile="1"]');
     if (existing) {
-      setCfLoaded(true);
-      return;
+      const markLoadedId = window.setTimeout(() => {
+        setCfLoaded(true);
+      }, 0);
+      return () => window.clearTimeout(markLoadedId);
     }
 
     const script = document.createElement("script");
@@ -115,9 +120,12 @@ export default function LoginPage() {
         setStatus({ msg: "Cloudflare 验证失败，请重试", type: "error" });
       },
     });
-    setCfWidgetReady(false);
+    const pendingId = window.setTimeout(() => {
+      setCfWidgetReady(false);
+    }, 0);
 
     return () => {
+      window.clearTimeout(pendingId);
       if (widgetIdRef.current && window.turnstile?.remove) {
         window.turnstile.remove(widgetIdRef.current);
       }
@@ -159,56 +167,61 @@ export default function LoginPage() {
 
   return (
     <div className="bsm-login-root">
-      <div className="bsm-login-box">
-        <div className="bsm-login-hero">
-          <h1 className="bsm-login-title">BiliMartMonitor</h1>
-          <p className="bsm-login-subtitle">Bilibili C2C 市场监控管理系统</p>
-        </div>
-
-        <div className="bsm-login-card">
-          <h2>登录系统</h2>
-
-          <div className="bsm-form">
-            <input
-              id="bsm-username"
-              className="bsm-input"
-              placeholder="用户名"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              onKeyDown={handleKeyDown}
-              autoComplete="username"
-            />
-            <input
-              id="bsm-password"
-              className="bsm-input"
-              placeholder="密码"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              onKeyDown={handleKeyDown}
-              autoComplete="current-password"
-            />
-
-            <p className={`bsm-status ${status.type}`}>{status.msg}</p>
-
-            {cfEnabled && (
-              <div className="bsm-login-turnstile-wrap">
-                <div ref={widgetHostRef} className="bsm-login-turnstile" />
-                {!cfWidgetReady && (
-                  <p className="bsm-login-turnstile-note">请先完成 Cloudflare 验证</p>
-                )}
-              </div>
-            )}
-
-            <button
-              id="bsm-login-btn"
-              className="bsm-btn bsm-btn-primary"
-              onClick={handleLogin}
-              disabled={loading}
-            >
-              {loading ? "登录中..." : "登录"}
-            </button>
+      <div className="bsm-login-shell">
+        <div className="bsm-login-box">
+          <div className="bsm-login-hero">
+            <h1 className="bsm-login-title">BiliMartMonitor</h1>
+            <p className="bsm-login-subtitle">Bilibili C2C 市场监控管理系统</p>
           </div>
+
+          <div className="bsm-login-card">
+            <h2>登录系统</h2>
+
+            <div className="bsm-form">
+              <input
+                id="bsm-username"
+                className="bsm-input"
+                placeholder="用户名"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                onKeyDown={handleKeyDown}
+                autoComplete="username"
+              />
+              <input
+                id="bsm-password"
+                className="bsm-input"
+                placeholder="密码"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={handleKeyDown}
+                autoComplete="current-password"
+              />
+
+              <p className={`bsm-status ${status.type}`}>{status.msg}</p>
+
+              {cfEnabled && (
+                <div className="bsm-login-turnstile-wrap">
+                  <div ref={widgetHostRef} className="bsm-login-turnstile" />
+                  {!cfWidgetReady && (
+                    <p className="bsm-login-turnstile-note">请先完成 Cloudflare 验证</p>
+                  )}
+                </div>
+              )}
+
+              <button
+                id="bsm-login-btn"
+                className="bsm-btn bsm-btn-primary"
+                onClick={handleLogin}
+                disabled={loading}
+              >
+                {loading ? "登录中..." : "登录"}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="bsm-login-footer">
+          <AppFooter />
         </div>
       </div>
     </div>

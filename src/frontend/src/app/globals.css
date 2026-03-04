@@ -351,6 +351,19 @@ input {
   padding: 2rem 1.5rem;
 }
 
+.bsm-footer {
+  width: 100%;
+  padding: 0 1.5rem 1.5rem;
+}
+
+.bsm-footer-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  text-align: center;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
 .bsm-card {
   background: var(--bg-card);
   border: 1px solid var(--brand-border);
@@ -435,9 +448,24 @@ input {
     var(--bg-base);
 }
 
-.bsm-login-box {
+.bsm-login-shell {
   width: 100%;
   max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.bsm-login-box {
+  width: 100%;
+}
+
+.bsm-login-footer {
+  width: 100%;
+}
+
+.bsm-login-footer .bsm-footer {
+  padding: 0;
 }
 
 .bsm-login-hero {

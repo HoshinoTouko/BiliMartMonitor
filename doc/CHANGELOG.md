@@ -11,9 +11,11 @@
 
 - **Market Filter UX**: Replaced the old mix of native `select` inputs and exposed category checkboxes with unified in-page dropdown menus for 时间 / 排序 / 分类. Category selections are now applied only when the dropdown closes, making multi-select changes less noisy.
 - **Price Discount Display**: Added compact `X.X折` labels beside prices on the market list, the market detail header, and recent listing rows.
+- **Shared App Footer**: The login page and in-app pages now render the same footer content, showing `v0.9.0 | © Touko Hoshino` from a shared frontend component.
 - **Admin Settings Polling Guard**: `/admin/settings` no longer starts polling cron status and logs before the page finishes its initial settings load, preventing a burst of early requests while the page is still bootstrapping.
 - **Scan Controls and Scheduling**: Added admin-only `立即扫描` and `重启 Cron` controls in system settings, simplified scan logs, enforced a 30-second scan timeout, made scan-interval saves restart cron immediately, and reset scan progress to page 1 on cron restart.
 - **Category-Aware Scan Rotation**: Multi-category scan mode now rotates categories one at a time with independent cursor state. `CUR` now caps at 30 pages per category.
+- **Test Suite Layout**: Python regression tests were moved from the root `tests/` folder to `src/backend/testsuite`, with `scripts/run-tests.sh` and `scripts/run-lint.sh` added as the standard local verification entry points.
 
 ### Fixed
 

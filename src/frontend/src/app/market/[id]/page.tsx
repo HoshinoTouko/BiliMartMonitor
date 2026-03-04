@@ -65,6 +65,12 @@ interface ChartDataPoint {
     sale_status?: number | null;
 }
 
+interface ChartDotShapeProps {
+    cx?: number;
+    cy?: number;
+    payload?: ChartDataPoint;
+}
+
 function timeAgo(dt: string | null): string {
     if (!dt) return "—";
     const date = new Date(dt.replace(" ", "T"));
@@ -280,8 +286,11 @@ export default function MarketItemDetailPage() {
                             <Tooltip content={<ChartTooltip />} cursor={{ strokeDasharray: '3 3', stroke: 'rgba(255,255,255,0.1)' }} />
                             <Scatter
                                 data={chartData}
-                                shape={(props: any) => {
+                                shape={(props: ChartDotShapeProps) => {
                                     const { cx, cy, payload } = props;
+                                    if (typeof cx !== "number" || typeof cy !== "number" || !payload) {
+                                        return null;
+                                    }
                                     let fill = "#10b981"; // success green
                                     if (payload.publish_status === 2) {
                                         fill = "#ef4444"; // error red

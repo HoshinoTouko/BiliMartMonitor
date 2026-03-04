@@ -39,16 +39,16 @@
 
 当前权限边界由以下测试文件直接覆盖：
 
-- `tests/test_accounts_router.py`
+- `src/backend/testsuite/test_accounts_router.py`
   - 管理员可以查看、新建账户。
   - 普通用户只能查看自己的账户。
   - 普通用户不能列出全部账户、不能新建账户、不能删除其他账户。
-- `tests/test_account_page_ui.py`
+- `src/backend/testsuite/test_account_page_ui.py`
   - `/account` 页面源码保持“我的账户在上、账户管理在下”的结构。
   - 非管理员分支不会渲染账户管理面板。
   - 顶部导航不再暴露独立“账户管理”入口。
   - `/admin/users` 前端页面会重定向到 `/account`。
-- `tests/test_settings_router.py`
+- `src/backend/testsuite/test_settings_router.py`
   - 普通用户可以读取自己的通知配置。
   - 普通用户不能读取或修改其他用户通知配置。
   - 普通用户不能访问系统设置。

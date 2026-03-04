@@ -59,7 +59,7 @@ PYTHONPATH=src ./.venv/bin/python src/bsm-cli/login.py
 5. 启动测试或服务：
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m unittest discover -s tests
+./scripts/run-tests.sh
 ```
 
 后端开发启动：
@@ -151,10 +151,16 @@ bili_session_cooldown_seconds: 60
 ## 测试
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m unittest discover -s tests
+./scripts/run-tests.sh
 ```
 
 测试会强制使用本地测试数据库。
+
+## Lint
+
+```bash
+./scripts/run-lint.sh
+```
 
 ## 前端
 
@@ -257,6 +263,12 @@ cp .env.example .deployment.env
 - `doc/CHANGELOG.md`: 变更记录
 - `doc/ACCOUNT_ACCESS_CONTROL.md`: 账号与权限设计
 
+## Co-workers
+
+- Codex
+- Gemini
+- Claude
+
 ## 贡献
 
 欢迎提交 Issue 和 PR。提交前请先阅读 `CONTRIBUTING.md`。
@@ -264,3 +276,5 @@ cp .env.example .deployment.env
 ## 运行截图
 
 ![运行截图](doc/runtime-screenshot.png)
+
+© Touko Hoshino

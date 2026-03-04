@@ -2,6 +2,7 @@
 import { useEffect, useState, useRef } from "react";
 import Link from "next/link";
 import { useAuth } from "@/contexts/AuthContext";
+import AppFooter from "@/components/AppFooter";
 
 interface ShellProps {
     title: React.ReactNode;
@@ -123,6 +124,7 @@ export default function Shell({ title, children, adminOnly = false }: ShellProps
                     {children}
                 </div>
             </main>
+            <AppFooter />
         </div>
     );
 }

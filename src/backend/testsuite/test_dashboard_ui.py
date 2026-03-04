@@ -2,7 +2,9 @@ import os
 import unittest
 
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..")
+)
 
 
 def read_text(relative_path: str) -> str:
@@ -32,8 +34,14 @@ class DashboardUiTestCase(unittest.TestCase):
         self.assertIn("Cron 已重启并立即执行", content)
         self.assertIn("if (loading || !settings)", content)
         self.assertIn('apiGet("/api/settings/logs?n=50")', content)
-        self.assertIn('const APP_VERSION = "0.9.0"', content)
-        self.assertIn("当前版本：v{APP_VERSION}", content)
+
+    def test_footer_uses_shared_version_and_copyright(self) -> None:
+        footer = read_text("src/frontend/src/components/AppFooter.tsx")
+        info = read_text("src/frontend/src/lib/appInfo.ts")
+
+        self.assertIn('export const APP_VERSION = "0.9.0"', info)
+        self.assertIn('export const APP_COPYRIGHT = "© Touko Hoshino"', info)
+        self.assertIn("v{APP_VERSION} | {APP_COPYRIGHT}", footer)
 
 
 if __name__ == "__main__":

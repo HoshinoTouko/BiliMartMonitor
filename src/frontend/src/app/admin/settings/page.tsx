@@ -43,7 +43,6 @@ const LEVEL_COLORS: Record<string, string> = {
     WARN: "#fbbf24",
     ERROR: "#f87171",
 };
-const APP_VERSION = "0.9.0";
 
 function timeAgo(iso: string): string {
     const diff = Math.floor((Date.now() - new Date(iso.replace(" ", "T")).getTime()) / 1000);
@@ -725,12 +724,6 @@ export default function SystemSettingsPage() {
                 </div>
             </div>
 
-            <div
-                className="bsm-text-muted"
-                style={{ textAlign: "center", fontSize: "0.8125rem", paddingBottom: "1rem" }}
-            >
-                当前版本：v{APP_VERSION}
-            </div>
         </Shell>
     );
 }

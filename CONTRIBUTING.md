@@ -23,14 +23,14 @@ pnpm install
 请至少执行：
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m unittest discover -s tests
+./scripts/run-tests.sh
 ```
 
 如果修改了前端，也请执行：
 
 ```bash
-cd frontend
-pnpm lint
+./scripts/run-lint.sh
+cd src/frontend
 pnpm build
 ```
 
