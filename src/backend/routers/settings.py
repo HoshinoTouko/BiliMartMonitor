@@ -27,6 +27,9 @@ from backend.auth import get_current_user, get_current_admin  # noqa: E402
 
 router = APIRouter()
 
+_ALL_PRICE_FILTERS = ["0-2000", "2000-3000", "3000-5000", "5000-10000", "10000-20000", "20000-0"]
+_ALL_DISCOUNT_FILTERS = ["70-100", "50-70", "30-50", "0-30"]
+
 
 def _unauthorized() -> JSONResponse:
     return JSONResponse({"detail": "authentication required"}, status_code=401)
@@ -45,6 +48,24 @@ def _can_access_user(actor: Dict[str, Any], username: str) -> bool:
     return "admin" in (actor.get("roles") or [])
 
 
+def _normalize_filter_selection(values: Optional[List[str]], all_options: List[str]) -> List[str]:
+    if values is None:
+        return []
+    selected = {str(item).strip() for item in values if str(item).strip()}
+    normalized = [option for option in all_options if option in selected]
+    if len(normalized) == len(all_options):
+        # All selected => store empty list (means no filter limit).
+        return []
+    return normalized
+
+
+def _filter_selection_for_response(values: Optional[List[str]], all_options: List[str]) -> List[str]:
+    selected = {str(item).strip() for item in (values or []) if str(item).strip()}
+    normalized = [option for option in all_options if option in selected]
+    # Empty means "all selected" in persisted config.
+    return normalized if normalized else list(all_options)
+
+
 def _load_settings() -> Dict[str, Any]:
     from bsm.settings import load_runtime_config
     from bsm.env import env_str
@@ -61,9 +82,10 @@ def _load_settings() -> Dict[str, Any]:
         "cloudflare_turnstile_secret_key_configured": bool(cfg.get("cloudflare_turnstile_secret_key", "")),
         "bili_session_pick_mode": cfg.get("bili_session_pick_mode", "round_robin"),
         "bili_session_cooldown_seconds": cfg.get("bili_session_cooldown_seconds", 60),
+        "admin_scan_summary_interval_seconds": cfg.get("admin_scan_summary_interval_seconds", 600),
         "admin_telegram_ids": cfg.get("admin_telegram_ids") or [],
-        "price_filters": cfg.get("price_filters") or ["3000-5000", "5000-10000", "20000-0", "10000-20000"],
-        "discount_filters": cfg.get("discount_filters") or ["70-100", "50-70", "30-50", "0-30"],
+        "price_filters": _filter_selection_for_response(cfg.get("price_filters"), _ALL_PRICE_FILTERS),
+        "discount_filters": _filter_selection_for_response(cfg.get("discount_filters"), _ALL_DISCOUNT_FILTERS),
         "db_backend": env_str("BSM_DB_BACKEND", "sqlite"),
         "cron": cron_state.to_dict(),
     }
@@ -80,6 +102,7 @@ class SettingsUpdate(BaseModel):
     cloudflare_turnstile_secret_key: Optional[str] = None
     bili_session_pick_mode: Optional[str] = None
     bili_session_cooldown_seconds: Optional[int] = None
+    admin_scan_summary_interval_seconds: Optional[int] = None
     admin_telegram_ids: Optional[List[str]] = None
     price_filters: Optional[List[str]] = None
     discount_filters: Optional[List[str]] = None
@@ -280,88 +303,104 @@ async def api_update_settings(body: SettingsUpdate, _: Dict[str, Any] = Depends(
 
     updated: Dict[str, Any] = {}
     restarted_cron = False
+    
+    def _save_setting(key: str, value: Any) -> None:
+        try:
+            save_yaml_config_value(key, value)
+        except Exception as exc:
+            raise RuntimeError(f"failed to persist '{key}': {exc}") from exc
+    try:
+        if body.scan_mode is not None:
+            if body.scan_mode not in ("latest", "continue", "continue_until_repeat"):
+                return JSONResponse(
+                    {"error": "scan_mode must be 'latest', 'continue', or 'continue_until_repeat'"},
+                    status_code=422,
+                )
+            _save_setting("scan_mode", body.scan_mode)
+            updated["scan_mode"] = body.scan_mode
 
-    if body.scan_mode is not None:
-        if body.scan_mode not in ("latest", "continue", "continue_until_repeat"):
-            return JSONResponse(
-                {"error": "scan_mode must be 'latest', 'continue', or 'continue_until_repeat'"},
-                status_code=422,
-            )
-        save_yaml_config_value("scan_mode", body.scan_mode)
-        updated["scan_mode"] = body.scan_mode
+        if body.interval is not None:
+            if body.interval < 5:
+                return JSONResponse({"error": "interval must be >= 5 seconds"}, status_code=422)
+            _save_setting("interval", body.interval)
+            updated["interval"] = body.interval
 
-    if body.interval is not None:
-        if body.interval < 5:
-            return JSONResponse({"error": "interval must be >= 5 seconds"}, status_code=422)
-        save_yaml_config_value("interval", body.interval)
-        updated["interval"] = body.interval
+        if body.category is not None:
+            _save_setting("category", body.category)
+            updated["category"] = body.category
 
-    if body.category is not None:
-        save_yaml_config_value("category", body.category)
-        updated["category"] = body.category
+        if body.timezone is not None:
+            _save_setting("timezone", body.timezone)
+            updated["timezone"] = body.timezone
 
-    if body.timezone is not None:
-        save_yaml_config_value("timezone", body.timezone)
-        updated["timezone"] = body.timezone
+        if body.app_base_url is not None:
+            app_base_url = str(body.app_base_url).strip().rstrip("/")
+            _save_setting("app_base_url", app_base_url)
+            updated["app_base_url"] = app_base_url
 
-    if body.app_base_url is not None:
-        app_base_url = str(body.app_base_url).strip().rstrip("/")
-        save_yaml_config_value("app_base_url", app_base_url)
-        updated["app_base_url"] = app_base_url
+        if body.cloudflare_validation_enabled is not None:
+            cloudflare_validation_enabled = bool(body.cloudflare_validation_enabled)
+            _save_setting("cloudflare_validation_enabled", cloudflare_validation_enabled)
+            updated["cloudflare_validation_enabled"] = cloudflare_validation_enabled
 
-    if body.cloudflare_validation_enabled is not None:
-        cloudflare_validation_enabled = bool(body.cloudflare_validation_enabled)
-        save_yaml_config_value("cloudflare_validation_enabled", cloudflare_validation_enabled)
-        updated["cloudflare_validation_enabled"] = cloudflare_validation_enabled
+        if body.cloudflare_turnstile_site_key is not None:
+            cloudflare_turnstile_site_key = str(body.cloudflare_turnstile_site_key).strip()
+            _save_setting("cloudflare_turnstile_site_key", cloudflare_turnstile_site_key)
+            updated["cloudflare_turnstile_site_key"] = cloudflare_turnstile_site_key
 
-    if body.cloudflare_turnstile_site_key is not None:
-        cloudflare_turnstile_site_key = str(body.cloudflare_turnstile_site_key).strip()
-        save_yaml_config_value("cloudflare_turnstile_site_key", cloudflare_turnstile_site_key)
-        updated["cloudflare_turnstile_site_key"] = cloudflare_turnstile_site_key
+        if body.cloudflare_turnstile_secret_key is not None:
+            cloudflare_turnstile_secret_key = str(body.cloudflare_turnstile_secret_key).strip()
+            _save_setting("cloudflare_turnstile_secret_key", cloudflare_turnstile_secret_key)
+            updated["cloudflare_turnstile_secret_key_configured"] = bool(cloudflare_turnstile_secret_key)
 
-    if body.cloudflare_turnstile_secret_key is not None:
-        cloudflare_turnstile_secret_key = str(body.cloudflare_turnstile_secret_key).strip()
-        save_yaml_config_value("cloudflare_turnstile_secret_key", cloudflare_turnstile_secret_key)
-        updated["cloudflare_turnstile_secret_key_configured"] = bool(cloudflare_turnstile_secret_key)
+        if body.bili_session_pick_mode is not None:
+            if body.bili_session_pick_mode not in ("round_robin", "random"):
+                return JSONResponse({"error": "bili_session_pick_mode must be 'round_robin' or 'random'"}, status_code=422)
+            _save_setting("bili_session_pick_mode", body.bili_session_pick_mode)
+            updated["bili_session_pick_mode"] = body.bili_session_pick_mode
 
-    if body.bili_session_pick_mode is not None:
-        if body.bili_session_pick_mode not in ("round_robin", "random"):
-            return JSONResponse({"error": "bili_session_pick_mode must be 'round_robin' or 'random'"}, status_code=422)
-        save_yaml_config_value("bili_session_pick_mode", body.bili_session_pick_mode)
-        updated["bili_session_pick_mode"] = body.bili_session_pick_mode
+        if body.bili_session_cooldown_seconds is not None:
+            if body.bili_session_cooldown_seconds < 0:
+                return JSONResponse({"error": "bili_session_cooldown_seconds must be >= 0"}, status_code=422)
+            _save_setting("bili_session_cooldown_seconds", body.bili_session_cooldown_seconds)
+            updated["bili_session_cooldown_seconds"] = body.bili_session_cooldown_seconds
 
-    if body.bili_session_cooldown_seconds is not None:
-        if body.bili_session_cooldown_seconds < 0:
-            return JSONResponse({"error": "bili_session_cooldown_seconds must be >= 0"}, status_code=422)
-        save_yaml_config_value("bili_session_cooldown_seconds", body.bili_session_cooldown_seconds)
-        updated["bili_session_cooldown_seconds"] = body.bili_session_cooldown_seconds
+        if body.admin_scan_summary_interval_seconds is not None:
+            if body.admin_scan_summary_interval_seconds <= 0:
+                return JSONResponse({"error": "admin_scan_summary_interval_seconds must be > 0"}, status_code=422)
+            _save_setting("admin_scan_summary_interval_seconds", body.admin_scan_summary_interval_seconds)
+            updated["admin_scan_summary_interval_seconds"] = body.admin_scan_summary_interval_seconds
 
-    if body.admin_telegram_ids is not None:
-        admin_telegram_ids: List[str] = []
-        seen_admin_ids = set()
-        for item in body.admin_telegram_ids:
-            text = str(item).strip()
-            if not text or text in seen_admin_ids:
-                continue
-            seen_admin_ids.add(text)
-            admin_telegram_ids.append(text)
-        save_yaml_config_value("admin_telegram_ids", admin_telegram_ids)
-        updated["admin_telegram_ids"] = admin_telegram_ids
+        if body.admin_telegram_ids is not None:
+            admin_telegram_ids: List[str] = []
+            seen_admin_ids = set()
+            for item in body.admin_telegram_ids:
+                text = str(item).strip()
+                if not text or text in seen_admin_ids:
+                    continue
+                seen_admin_ids.add(text)
+                admin_telegram_ids.append(text)
+            _save_setting("admin_telegram_ids", admin_telegram_ids)
+            updated["admin_telegram_ids"] = admin_telegram_ids
 
-    if body.price_filters is not None:
-        save_yaml_config_value("price_filters", body.price_filters)
-        updated["price_filters"] = body.price_filters
+        if body.price_filters is not None:
+            price_filters = _normalize_filter_selection(body.price_filters, _ALL_PRICE_FILTERS)
+            _save_setting("price_filters", price_filters)
+            updated["price_filters"] = price_filters
 
-    if body.discount_filters is not None:
-        save_yaml_config_value("discount_filters", body.discount_filters)
-        updated["discount_filters"] = body.discount_filters
+        if body.discount_filters is not None:
+            discount_filters = _normalize_filter_selection(body.discount_filters, _ALL_DISCOUNT_FILTERS)
+            _save_setting("discount_filters", discount_filters)
+            updated["discount_filters"] = discount_filters
 
-    if updated:
-        reset_public_account_settings_cache()
-    if body.interval is not None:
-        from backend.main import restart_cron_task
+        if updated:
+            reset_public_account_settings_cache()
+        if body.interval is not None:
+            from backend.main import restart_cron_task
 
-        await restart_cron_task()
-        restarted_cron = True
+            await restart_cron_task()
+            restarted_cron = True
+    except Exception as exc:
+        return JSONResponse({"error": f"failed to save settings: {exc}"}, status_code=500)
 
     return JSONResponse({"ok": True, "updated": updated, "restarted_cron": restarted_cron})

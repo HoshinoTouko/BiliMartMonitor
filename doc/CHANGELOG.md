@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.9.1] — 2026-03-06
+
+### Added
+
+- **Admin Scan Summary Push Window Config**: Added `admin_scan_summary_interval_seconds` (default `600`) to runtime config and admin settings UI/API. Cron now sends periodic admin Telegram scan summaries using this configurable interval.
+- **Category Sleep Backoff**: Added first-page repeat sleep backoff per category in scan loop. When a category hits repeat on page 1, it sleeps for `1 -> 2 -> 3 ...` rounds (max `6`) before scanning again.
+
+### Changed
+
+- **Multi-Category Scan Scheduling**: Enabled categories are no longer scanned round-robin one-per-cycle. Each cron cycle now scans all active categories in parallel.
+- **Multi-Session Category Assignment**: When multiple Bili sessions are available, category scans are distributed to maximize concurrent usage while keeping category-to-session assignments sticky when possible.
+- **Market Default Ordering**: Market list default ordering now follows `c2c_items_id DESC`.
+- **Filter Semantics (`price_filters` / `discount_filters`)**: If all options are selected, settings now persist as an empty list (`[]`) to represent "no limit", and settings API reads `[]` back as "all selected" for UI display.
+- **Market Search Button Behavior**: On `/market`, clicking search now triggers a refresh even when the keyword is unchanged.
+
+### Fixed
+
+- **Settings Save Reliability**: Config persistence no longer silently swallows write failures; `/api/settings` now returns an explicit save error when persistence fails.
+
 ## [0.9.0] — 2026-03-04
 
 ### Added

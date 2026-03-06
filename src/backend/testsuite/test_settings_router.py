@@ -145,7 +145,7 @@ class SettingsRouterTestCase(unittest.TestCase):
     @patch("backend.main.asyncio.create_task")
     @patch("backend.main._stop_cron_task_locked")
     @patch("backend.main.cron_loop", new_callable=MagicMock)
-    def test_restart_cron_clears_scan_progress(
+    def test_restart_cron_keeps_scan_progress(
         self,
         mock_cron_loop: MagicMock,
         mock_stop_cron_task_locked: MagicMock,
@@ -160,8 +160,8 @@ class SettingsRouterTestCase(unittest.TestCase):
         import asyncio
         asyncio.run(restart_cron_task())
 
-        self.assertEqual(cron_runner._SCAN_CATEGORY_INDEX, 0)
-        self.assertEqual(cron_runner._CATEGORY_SCAN_STATE, {})
+        self.assertEqual(cron_runner._SCAN_CATEGORY_INDEX, 1)
+        self.assertEqual(cron_runner._CATEGORY_SCAN_STATE, {"2312": {"next_id": "cursor-9", "page_count": 9}})
         mock_stop_cron_task_locked.assert_awaited_once_with()
         mock_cron_loop.assert_called_once_with()
         mock_create_task.assert_called_once()
@@ -392,6 +392,21 @@ class SettingsRouterTestCase(unittest.TestCase):
         self.assertEqual(refreshed["app_base_url"], "https://bsm.example.com")
         self.assertEqual(refreshed["admin_telegram_ids"], ["10001", "10002"])
 
+    @patch("bsm.settings.save_yaml_config_value")
+    def test_update_settings_returns_500_when_persist_fails(self, mock_save_yaml_config_value: MagicMock) -> None:
+        mock_save_yaml_config_value.side_effect = PermissionError("read-only file system")
+
+        response = self.client.put(
+            "/api/settings",
+            auth=("testadmin", "admin"),
+            json={"app_base_url": "https://bsm.example.com"},
+        )
+
+        self.assertEqual(response.status_code, 500)
+        data = response.json()
+        self.assertIn("failed to save settings", data["error"])
+        self.assertIn("app_base_url", data["error"])
+
     def test_admin_can_update_cloudflare_validation_settings(self) -> None:
         response = self.client.put(
             "/api/settings",
@@ -421,6 +436,45 @@ class SettingsRouterTestCase(unittest.TestCase):
         admin_data = admin_resp.json()
         self.assertTrue(admin_data["cloudflare_turnstile_secret_key_configured"])
 
+    def test_all_selected_price_and_discount_filters_are_persisted_as_empty(self) -> None:
+        all_price_filters = ["0-2000", "2000-3000", "3000-5000", "5000-10000", "10000-20000", "20000-0"]
+        all_discount_filters = ["70-100", "50-70", "30-50", "0-30"]
+        response = self.client.put(
+            "/api/settings",
+            auth=("testadmin", "admin"),
+            json={
+                "price_filters": all_price_filters,
+                "discount_filters": all_discount_filters,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["updated"]["price_filters"], [])
+        self.assertEqual(data["updated"]["discount_filters"], [])
+
+        from bsm.settings import load_yaml_config
+        yaml_cfg = load_yaml_config()
+        self.assertEqual(yaml_cfg.get("price_filters"), [])
+        self.assertEqual(yaml_cfg.get("discount_filters"), [])
+
+    def test_empty_persisted_filters_are_returned_as_all_selected(self) -> None:
+        response = self.client.put(
+            "/api/settings",
+            auth=("testadmin", "admin"),
+            json={
+                "price_filters": [],
+                "discount_filters": [],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+        follow_up = self.client.get("/api/settings", auth=("testadmin", "admin"))
+        self.assertEqual(follow_up.status_code, 200)
+        data = follow_up.json()
+        self.assertEqual(data["price_filters"], ["0-2000", "2000-3000", "3000-5000", "5000-10000", "10000-20000", "20000-0"])
+        self.assertEqual(data["discount_filters"], ["70-100", "50-70", "30-50", "0-30"])
+
     def test_admin_can_update_session_picker_settings(self) -> None:
         response = self.client.put(
             "/api/settings",
@@ -442,6 +496,23 @@ class SettingsRouterTestCase(unittest.TestCase):
         refreshed = follow_up.json()
         self.assertEqual(refreshed["bili_session_pick_mode"], "random")
         self.assertEqual(refreshed["bili_session_cooldown_seconds"], 90)
+
+    def test_admin_can_update_admin_scan_summary_interval_seconds(self) -> None:
+        response = self.client.put(
+            "/api/settings",
+            auth=("testadmin", "admin"),
+            json={"admin_scan_summary_interval_seconds": 300},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["updated"]["admin_scan_summary_interval_seconds"], 300)
+
+        follow_up = self.client.get("/api/settings", auth=("testadmin", "admin"))
+        self.assertEqual(follow_up.status_code, 200)
+        refreshed = follow_up.json()
+        self.assertEqual(refreshed["admin_scan_summary_interval_seconds"], 300)
 
     def test_admin_cannot_set_invalid_session_picker_mode(self) -> None:
         response = self.client.put(

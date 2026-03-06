@@ -95,6 +95,7 @@ class MarketAPITestCase(unittest.TestCase):
         items, total_count, total_pages = db.list_market_items(page=1, limit=12)
         self.assertEqual(total_count, 3)
         self.assertEqual(len(items), 3)
+        self.assertEqual([it["id"] for it in items], [2003, 2002, 2001])
 
     def test_list_market_items_pagination(self) -> None:
         db.save_items(SAMPLE_ITEMS)

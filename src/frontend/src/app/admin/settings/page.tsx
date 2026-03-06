@@ -25,6 +25,7 @@ interface Settings {
     cloudflare_turnstile_secret_key_configured: boolean;
     bili_session_pick_mode: string;
     bili_session_cooldown_seconds: number;
+    admin_scan_summary_interval_seconds: number;
     admin_telegram_ids: string[];
     price_filters: string[];
     discount_filters: string[];
@@ -82,6 +83,7 @@ export default function SystemSettingsPage() {
     const [clearCloudflareTurnstileSecretKey, setClearCloudflareTurnstileSecretKey] = useState(false);
     const [biliSessionPickMode, setBiliSessionPickMode] = useState("round_robin");
     const [biliSessionCooldownSeconds, setBiliSessionCooldownSeconds] = useState(60);
+    const [adminScanSummaryIntervalSeconds, setAdminScanSummaryIntervalSeconds] = useState(600);
     const [adminTelegramIdsText, setAdminTelegramIdsText] = useState("");
     const [priceFilters, setPriceFilters] = useState<string[]>([]);
     const [discountFilters, setDiscountFilters] = useState<string[]>([]);
@@ -103,6 +105,7 @@ export default function SystemSettingsPage() {
             setClearCloudflareTurnstileSecretKey(false);
             setBiliSessionPickMode(data.bili_session_pick_mode || "round_robin");
             setBiliSessionCooldownSeconds(data.bili_session_cooldown_seconds ?? 60);
+            setAdminScanSummaryIntervalSeconds(data.admin_scan_summary_interval_seconds ?? 600);
             setAdminTelegramIdsText((data.admin_telegram_ids || []).join("\n"));
             setPriceFilters(data.price_filters || []);
             setDiscountFilters(data.discount_filters || []);
@@ -181,6 +184,7 @@ export default function SystemSettingsPage() {
                 cloudflare_turnstile_site_key: cloudflareTurnstileSiteKey.trim(),
                 bili_session_pick_mode: biliSessionPickMode,
                 bili_session_cooldown_seconds: biliSessionCooldownSeconds,
+                admin_scan_summary_interval_seconds: adminScanSummaryIntervalSeconds,
                 admin_telegram_ids: adminTelegramIdsText.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean),
                 price_filters: priceFilters,
                 discount_filters: discountFilters,
@@ -344,8 +348,8 @@ export default function SystemSettingsPage() {
                                     <input type="radio" name="scan_mode" value="continue_until_repeat"
                                         checked={scanMode === "continue_until_repeat"}
                                         onChange={() => setScanMode("continue_until_repeat")} />
-                                    <span title="像 continue 一样翻页续扫，但只要当前页出现任意已存在商品，就在下一轮回到第一页；同样最多推进 30 页，重启后也会从第一页开始。">
-                                        CUR（遇重复回首页，最多 30 页）
+                                    <span title="像 continue 一样翻页续扫，但只要当前页出现任意已存在商品，就在下一轮回到第一页；同样最多推进 50 页。扫描进度会保存在本地状态中。">
+                                        CUR（遇重复回首页，最多 50 页）
                                     </span>
                                 </label>
                             </div>
@@ -535,6 +539,24 @@ export default function SystemSettingsPage() {
                                 />
                                 <span className="bsm-text-muted" style={{ marginLeft: "0.5rem", fontSize: "0.8125rem" }}>
                                     某个 Session 报错后，在冷却期内不会被再次选中；0 表示关闭
+                                </span>
+                            </div>
+                        </div>
+
+                        <div className="bsm-settings-row">
+                            <label className="bsm-settings-label">管理员扫描汇总推送周期（秒）</label>
+                            <div className="bsm-settings-control">
+                                <input
+                                    type="number"
+                                    min={1}
+                                    max={86400}
+                                    className="bsm-input"
+                                    style={{ width: "120px" }}
+                                    value={adminScanSummaryIntervalSeconds}
+                                    onChange={(e) => setAdminScanSummaryIntervalSeconds(Number(e.target.value))}
+                                />
+                                <span className="bsm-text-muted" style={{ marginLeft: "0.5rem", fontSize: "0.8125rem" }}>
+                                    默认 600 秒；按该周期向 Admin Telegram 推送分类扫描汇总
                                 </span>
                             </div>
                         </div>

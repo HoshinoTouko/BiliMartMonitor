@@ -25,7 +25,7 @@ class DashboardUiTestCase(unittest.TestCase):
         content = read_text("src/frontend/src/app/admin/settings/page.tsx")
 
         self.assertIn('value="continue_until_repeat"', content)
-        self.assertIn("CUR（遇重复回首页，最多 30 页）", content)
+        self.assertIn("CUR（遇重复回首页，最多 50 页）", content)
         self.assertIn("重启 Cron", content)
         self.assertIn("立即扫描", content)
         self.assertIn('apiPost("/api/settings/cron/restart"', content)

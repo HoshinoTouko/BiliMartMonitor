@@ -77,11 +77,8 @@ async def start_cron_task() -> bool:
 async def restart_cron_task() -> None:
     global _cron_task
 
-    from backend.cron_runner import reset_scan_progress
-
     async with _cron_task_lock:
         await _stop_cron_task_locked()
-        reset_scan_progress()
         _cron_task = asyncio.create_task(cron_loop())
 
 

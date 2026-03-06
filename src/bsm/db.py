@@ -425,7 +425,8 @@ def _market_page_order_clauses(sort_by: str):
         return (C2CItem.price.asc(), C2CItem.updated_at.desc())
     if sort_by == "PRICE_DESC":
         return (C2CItem.price.desc(), C2CItem.updated_at.desc())
-    return (C2CItem.updated_at.desc(),)
+    # Default market ordering follows c2c item id descending.
+    return (C2CItem.c2c_items_id.desc(),)
 
 
 def _recent_listing_page_order_clauses(numbered_rows, sort_by: str):

@@ -76,23 +76,28 @@ def load_yaml_config() -> Dict[str, Any]:
         return {}
 
 def save_yaml_config_value(key: str, value: Any) -> None:
+    import os
     try:
         import yaml
     except ModuleNotFoundError:
-        return
+        raise RuntimeError("PyYAML is required to save config")
 
+    load_dotenv()
     path = _yaml_config_path(for_write=True)
     data = load_yaml_config()
     if value is None:
         data.pop(key, None)
     else:
         data[key] = value
-    
+
     try:
+        parent_dir = os.path.dirname(path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError(f"failed to write config file '{path}': {exc}") from exc
 
 
 def _normalize_string_list(value: Any) -> List[str]:
@@ -192,6 +197,10 @@ def load_runtime_config() -> Dict[str, Any]:
             yaml_config.get("bili_session_cooldown_seconds", 60),
             60,
         ),
+        "admin_scan_summary_interval_seconds": _positive_int(
+            yaml_config.get("admin_scan_summary_interval_seconds", 600),
+            600,
+        ),
     }
     cfg["admin_telegram_ids"] = _normalize_string_list(yaml_config.get("admin_telegram_ids"))
     price_filters = yaml_config.get("price_filters")
@@ -243,6 +252,7 @@ def list_runtime_settings() -> Dict[str, Any]:
         "cloudflare_turnstile_secret_key": cfg.get("cloudflare_turnstile_secret_key", ""),
         "bili_session_pick_mode": cfg.get("bili_session_pick_mode"),
         "bili_session_cooldown_seconds": cfg.get("bili_session_cooldown_seconds"),
+        "admin_scan_summary_interval_seconds": cfg.get("admin_scan_summary_interval_seconds"),
         "admin_telegram_ids": cfg.get("admin_telegram_ids") or [],
         "bot_id": cfg.get("telegram", {}).get("bot_id"),
     }

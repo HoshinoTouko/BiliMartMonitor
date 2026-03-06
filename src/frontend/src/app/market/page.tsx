@@ -195,7 +195,13 @@ export default function MarketFeedPage() {
     }, [fetchItems, query, sortBy, timeFilter, categoryFilters]);
 
     const handleSearch = () => {
-        setQuery(inputValue);
+        const nextQuery = inputValue;
+        if (nextQuery === query) {
+            fetchItems(1, query, sortBy, timeFilter, categoryFilters);
+            setPagination((prev) => ({ ...prev, page: 1 }));
+            return;
+        }
+        setQuery(nextQuery);
     };
 
     const handleKeyDown = (e: React.KeyboardEvent) => {

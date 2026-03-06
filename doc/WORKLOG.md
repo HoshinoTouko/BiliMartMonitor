@@ -1,5 +1,36 @@
 # Work Log
 
+## 2026-03-06 Parallel Category Scan, Session Affinity, and Admin Summary Enhancements
+
+### Planned
+
+- Remove one-category-per-round polling for multi-category scans.
+- Utilize multiple Bili sessions concurrently while keeping category/session affinity stable.
+- Add periodic admin Telegram scan summary with configurable interval.
+- Reduce shallow-page churn by adding a category sleep backoff when page 1 repeats are detected.
+- Align market/filter UX defaults and persistence behavior with real-world ops usage.
+
+### Step Log
+
+1. Reworked `src/backend/cron_runner.py` to scan all active categories in a single cycle and execute category scans in parallel.
+2. Added category-to-session sticky assignment so categories prefer the same `login_username` across rounds while still spreading load across available sessions.
+3. Added runtime-configurable admin summary push cadence (`admin_scan_summary_interval_seconds`, default `600`) across config loading, settings API, and admin settings UI.
+4. Implemented per-category sleep backoff: when page 1 includes repeat items, the category enters sleep rounds with incremental backoff `1 -> 2 -> 3 ...` capped at `6`.
+5. Added and expanded cron regression tests for summary formatting, category sleep backoff progression/cap, and new multi-category scan behavior.
+6. Updated settings and market behavior:
+   - `price_filters` / `discount_filters` full-selection now persists as `[]` (unlimited semantics), with response normalization back to "all selected".
+   - market default order now uses `c2c_items_id desc`.
+   - `/market` search button now refreshes even when query text is unchanged.
+7. Improved settings persistence error handling so failed config writes are surfaced via API errors instead of silently passing.
+8. Synced `config.yaml.example` comments with current scan behavior (parallel multi-category + first-page repeat sleep backoff).
+
+### Verification
+
+- `pytest -q src/backend/testsuite/test_cron_runner.py`
+- `pytest -q src/backend/testsuite/test_settings_router.py`
+- `pytest -q src/backend/testsuite/test_market_router.py`
+- `pytest -q src/backend/testsuite/test_market_api.py`
+
 ## 2026-03-04 Scan Controls, Category Rotation, and Market Filter UX
 
 ### Planned

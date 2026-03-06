@@ -1,4 +1,6 @@
 # 扫描模式: latest / continue / continue_until_repeat
+# - 多个分类会在同一轮同时扫描（不再轮询）
+# - continue_until_repeat: 某分类第1页出现重复时，触发该分类休眠退避（1→2→3...轮，最多6轮）
 scan_mode: latest
 
 # 扫描间隔(秒)
@@ -24,6 +26,7 @@ discount_filters:
 - 30-50
 - 0-30
 - 70-100
+# 分类ID，支持逗号分隔多个；多个分类会在同一轮并发扫描
 category: '2312'
 timezone: Asia/Shanghai
 app_base_url: ""
@@ -39,6 +42,9 @@ bili_session_pick_mode: round_robin
 
 # Session 报错后的冷却期(秒), 0 表示关闭冷却
 bili_session_cooldown_seconds: 60
+
+# 管理员扫描汇总推送周期(秒)，默认每 600 秒推送一次
+admin_scan_summary_interval_seconds: 600
 
 telegram:
   enabled: false
