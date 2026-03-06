@@ -240,7 +240,7 @@ export default function ProductDetailPage() {
     return (
         <Shell title={loading ? <div className="bsm-market-skeleton-detail" style={{ height: "32px", width: "180px", margin: 0 }} /> : (item?.name ?? "商品详情")}>
             <div className="bsm-detail-back">
-                <Link href="/market" className="bsm-link" style={{ fontSize: "0.875rem" }}>
+                <Link href="/market" className="bsm-link" style={{ fontSize: "0.875rem" }} prefetch={false}>
                     ← 返回市场列表
                 </Link>
             </div>
@@ -402,7 +402,9 @@ export default function ProductDetailPage() {
                                 }}
                                 style={{ width: "auto" }}
                             >
-                                <option value="TIME_DESC">默认排序 (时间)</option>
+                                <option value="TIME_DESC">创建时间(新-旧)</option>
+                                <option value="ID_DESC">ID排序(大-小)</option>
+                                <option value="ID_ASC">ID排序(小-大)</option>
                                 <option value="PRICE_ASC">价格升序</option>
                                 <option value="PRICE_DESC">价格降序</option>
                             </select>

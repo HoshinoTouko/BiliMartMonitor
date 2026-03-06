@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -35,8 +36,10 @@ class CronState:
     total_scans: int = 0
     today_scans: int = 0
     today_key: Optional[str] = None
+    last_activity_at: Optional[str] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     _logs: deque = field(default_factory=lambda: deque(maxlen=_MAX_LOGS), repr=False, compare=False)
+    _last_activity_monotonic: float = field(default=0.0, repr=False, compare=False)
 
     # ------------------------------------------------------------------ #
     def _get_tz(self) -> "zoneinfo.ZoneInfo":
@@ -53,6 +56,8 @@ class CronState:
         entry = LogEntry(ts=datetime.now(tz).strftime("%H:%M:%S"), level=level, msg=msg)
         with self._lock:
             self._logs.append(entry)
+            self.last_activity_at = datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S%z")
+            self._last_activity_monotonic = time.monotonic()
         if level == "ERROR":
             _CRON_LOG.error(msg)
         elif level == "WARN":
@@ -92,6 +97,8 @@ class CronState:
             self.last_error = error
             self.total_scans += 1
             self.today_scans += 1
+            self.last_activity_at = now.strftime("%Y-%m-%dT%H:%M:%S%z")
+            self._last_activity_monotonic = time.monotonic()
             
         # Save outside lock to avoid potential deadlocks if set_metadata takes time
         self.save()
@@ -105,6 +112,7 @@ class CronState:
             return {
                 "is_running": self.is_running,
                 "last_scan_at": self.last_scan_at,
+                "last_activity_at": self.last_activity_at,
                 "last_scan_count": self.last_scan_count,
                 "last_saved": self.last_saved,
                 "last_inserted": self.last_inserted,
@@ -114,6 +122,13 @@ class CronState:
                 "total_scans": self.total_scans,
                 "today_scans": self.today_scans,
             }
+
+    def seconds_since_activity(self) -> Optional[float]:
+        with self._lock:
+            last = self._last_activity_monotonic
+        if last <= 0:
+            return None
+        return max(0.0, time.monotonic() - last)
 
     def load(self) -> None:
         """Load persistent stats from database."""

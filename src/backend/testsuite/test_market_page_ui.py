@@ -35,6 +35,15 @@ class MarketPageUiTestCase(unittest.TestCase):
         self.assertIn("function discountText", content)
         self.assertIn("show_market_price", content)
         self.assertIn("toFixed(1)}折", content)
+        self.assertIn('{ value: "TIME_DESC", label: "创建时间(新-旧)" }', content)
+        self.assertIn('{ value: "ID_DESC", label: "ID排序(大-小)" }', content)
+        self.assertIn('{ value: "ID_ASC", label: "ID排序(小-大)" }', content)
+
+    def test_market_page_disables_link_prefetch(self) -> None:
+        content = read_text("src/frontend/src/app/market/page.tsx")
+
+        self.assertIn("className=\"bsm-market-card\"", content)
+        self.assertIn("prefetch={false}", content)
 
 
 if __name__ == "__main__":

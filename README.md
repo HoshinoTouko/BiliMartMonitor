@@ -225,6 +225,12 @@ docker run --rm -it \
 ./scripts/run-docker.sh
 ```
 
+默认会以 `--restart unless-stopped` 启动容器；如需改为 `always`：
+
+```bash
+RESTART_POLICY=always ./scripts/run-docker.sh
+```
+
 云端发布：
 
 ```bash

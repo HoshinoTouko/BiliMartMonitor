@@ -6,7 +6,8 @@ scan_mode: latest
 # 扫描间隔(秒)
 interval: 60
 
-# 排序方式
+# 排序方式（默认: 创建时间排序）
+# TIME_DESC: 创建时间排序（新 -> 旧）
 sort_type: TIME_DESC
 
 # 扫描价格区间 (单位: 分)

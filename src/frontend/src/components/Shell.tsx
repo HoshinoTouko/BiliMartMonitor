@@ -94,7 +94,7 @@ export default function Shell({ title, children, adminOnly = false }: ShellProps
                     <nav className="bsm-nav">
                         <div className="bsm-nav-inner">
                             {navItems.map((item) => (
-                                <Link key={item.href} href={item.href} className="bsm-nav-link">
+                                <Link key={item.href} href={item.href} className="bsm-nav-link" prefetch={false}>
                                     {item.label}
                                 </Link>
                             ))}
@@ -114,7 +114,7 @@ export default function Shell({ title, children, adminOnly = false }: ShellProps
                     {role === "guest" && (
                         <div className="bsm-alert bsm-alert-info">
                             请先在{" "}
-                            <Link href="/" className="bsm-link">
+                            <Link href="/" className="bsm-link" prefetch={false}>
                                 登录页
                             </Link>{" "}
                             输入账号密码进入系统。

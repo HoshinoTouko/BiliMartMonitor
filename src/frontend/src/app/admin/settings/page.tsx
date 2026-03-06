@@ -371,6 +371,19 @@ export default function SystemSettingsPage() {
                             </div>
                         </div>
 
+                        {/* sort_type */}
+                        <div className="bsm-settings-row">
+                            <label className="bsm-settings-label">
+                                排序方式
+                                <span className="bsm-text-muted" style={{ fontWeight: 400, marginLeft: "0.25rem", fontSize: "0.75rem" }}>(config.yaml)</span>
+                            </label>
+                            <div className="bsm-settings-control">
+                                <span className="bsm-text-muted" style={{ fontSize: "0.875rem" }}>
+                                    创建时间排序（TIME_DESC，默认）
+                                </span>
+                            </div>
+                        </div>
+
                         {/* category */}
                         <div className="bsm-settings-row">
                             <label className="bsm-settings-label bsm-settings-label-top">

@@ -597,7 +597,9 @@ export default function MarketItemDetailPage() {
                                     }}
                                     style={{ width: "auto" }}
                                 >
-                                    <option value="TIME_DESC">默认排序 (时间)</option>
+                                    <option value="TIME_DESC">创建时间(新-旧)</option>
+                                    <option value="ID_DESC">ID排序(大-小)</option>
+                                    <option value="ID_ASC">ID排序(小-大)</option>
                                     <option value="PRICE_ASC">价格升序</option>
                                     <option value="PRICE_DESC">价格降序</option>
                                 </select>

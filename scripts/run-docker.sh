@@ -7,6 +7,7 @@ cd "$REPO_ROOT"
 
 IMAGE_NAME="bsm-container"
 PORT=8080
+RESTART_POLICY="${RESTART_POLICY:-unless-stopped}"
 
 echo "Checking if Docker is running..."
 if ! docker info >/dev/null 2>&1; then
@@ -26,11 +27,13 @@ docker rm -f "$IMAGE_NAME" 2>/dev/null || true
 echo "Starting Docker container on http://localhost:$PORT ..."
 echo ""
 echo "  ✅  Server → http://localhost:$PORT"
-echo "  Press Ctrl+C to stop."
+echo "  Restart policy → $RESTART_POLICY"
+echo "  Press Ctrl+C to stop (manual stop will not auto-restart)."
 echo ""
 
-docker run --rm -it \
+docker run -it \
   --name "$IMAGE_NAME" \
+  --restart "$RESTART_POLICY" \
   -p "$PORT":8080 \
   -v "$(pwd)/.deployment.env:/app/.env" \
   -v "$(pwd)/config.yaml:/app/config.yaml" \

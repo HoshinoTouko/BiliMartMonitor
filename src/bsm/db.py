@@ -421,20 +421,38 @@ def _market_recent_listing_count_expr(cutoff: Optional[str] = None):
 
 
 def _market_page_order_clauses(sort_by: str):
+    created_or_updated = func.coalesce(C2CItem.created_at, C2CItem.updated_at)
+    if sort_by == "TIME_DESC":
+        return (created_or_updated.desc(), C2CItem.c2c_items_id.desc())
+    if sort_by == "TIME_ASC":
+        return (created_or_updated.asc(), C2CItem.c2c_items_id.asc())
+    if sort_by == "ID_ASC":
+        return (C2CItem.c2c_items_id.asc(),)
+    if sort_by == "ID_DESC":
+        return (C2CItem.c2c_items_id.desc(),)
     if sort_by == "PRICE_ASC":
-        return (C2CItem.price.asc(), C2CItem.updated_at.desc())
+        return (C2CItem.price.asc(), created_or_updated.desc())
     if sort_by == "PRICE_DESC":
-        return (C2CItem.price.desc(), C2CItem.updated_at.desc())
-    # Default market ordering follows c2c item id descending.
-    return (C2CItem.c2c_items_id.desc(),)
+        return (C2CItem.price.desc(), created_or_updated.desc())
+    # Default market ordering follows creation timestamp (created_at) descending.
+    return (created_or_updated.desc(), C2CItem.c2c_items_id.desc())
 
 
 def _recent_listing_page_order_clauses(numbered_rows, sort_by: str):
+    created_or_updated = func.coalesce(numbered_rows.c.created_at, numbered_rows.c.updated_at)
+    if sort_by == "TIME_DESC":
+        return (created_or_updated.desc(), numbered_rows.c.c2c_items_id.desc())
+    if sort_by == "TIME_ASC":
+        return (created_or_updated.asc(), numbered_rows.c.c2c_items_id.asc())
+    if sort_by == "ID_ASC":
+        return (numbered_rows.c.c2c_items_id.asc(),)
+    if sort_by == "ID_DESC":
+        return (numbered_rows.c.c2c_items_id.desc(),)
     if sort_by == "PRICE_ASC":
-        return (numbered_rows.c.est_price.asc(), numbered_rows.c.updated_at.desc())
+        return (numbered_rows.c.est_price.asc(), created_or_updated.desc())
     if sort_by == "PRICE_DESC":
-        return (numbered_rows.c.est_price.desc(), numbered_rows.c.updated_at.desc())
-    return (numbered_rows.c.updated_at.desc(),)
+        return (numbered_rows.c.est_price.desc(), created_or_updated.desc())
+    return (created_or_updated.desc(), numbered_rows.c.c2c_items_id.desc())
 
 
 def _load_market_items_page(

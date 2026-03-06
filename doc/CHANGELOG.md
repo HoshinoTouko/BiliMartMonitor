@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.9.2] — 2026-03-06
+
+### Added
+
+- **Cron Monitor Heartbeat/Uptime Logs**: Added monitor heartbeat logs with `uptime`, `idle`, and monitor check interval output to improve runtime visibility in Cloudflare-only logging environments.
+- **Frontend API Retry Layer**: Added a centralized retry mechanism in `src/frontend/src/lib/api.ts` with up to 3 attempts for transient failures (`timeout`, network error, `408/429/5xx`) using exponential backoff.
+
+### Changed
+
+- **Market Sorting Semantics**: `TIME_DESC` now maps to creation-time ordering (`created_at DESC`, fallback `updated_at`) instead of implicit ID order. Added explicit `ID_ASC` / `ID_DESC` support in backend market ordering paths.
+- **Market UI Sort Options**: Updated market and listing sort labels to `创建时间(新-旧)` and added explicit ID sort options in `/market`, `/market/[id]`, and `/product/[id]`.
+- **Next.js Prefetch Policy (Market)**: Disabled prefetch for all links in `/market` card list to reduce unsolicited XHR, while keeping `/market/[id]` page navigation links on default prefetch behavior.
+- **Scan Sort Default Copy**: Synced scan sort default copy to `创建时间排序（TIME_DESC）` in `config.yaml.example` and admin settings UI.
+- **Cloudflare Container Idle Timeout**: Updated `cf-worker/index.ts` container `sleepAfter` to `720h` for long idle retention.
+- **Local CF Docker Runner Restart Policy**: `scripts/run-docker.sh` now defaults to Docker `--restart unless-stopped` (configurable via `RESTART_POLICY`), and README Cloudflare container instructions were updated accordingly.
+
+### Tests
+
+- Added DB regression assertions for `ID_ASC` / `ID_DESC` listing ordering and `TIME_DESC` creation-time ordering in `test_db.py`.
+- Added market UI assertions for new sort options in `test_market_page_ui.py`.
+- Added market prefetch policy assertions for `/market` and `/market/[id]` in UI tests.
+- Added admin settings UI assertion for scan sort default copy in `test_dashboard_ui.py`.
+
 ## [0.9.1] — 2026-03-06
 
 ### Added

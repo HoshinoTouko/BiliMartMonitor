@@ -72,7 +72,9 @@ export default function MarketFeedPage() {
         { value: "72", label: "3天内" },
     ];
     const sortOptions = [
-        { value: "TIME_DESC", label: "最新上架" },
+        { value: "TIME_DESC", label: "创建时间(新-旧)" },
+        { value: "ID_DESC", label: "ID排序(大-小)" },
+        { value: "ID_ASC", label: "ID排序(小-大)" },
         { value: "PRICE_ASC", label: "价格升序" },
         { value: "PRICE_DESC", label: "价格降序" },
     ];
@@ -309,7 +311,7 @@ export default function MarketFeedPage() {
                             onClick={() => setOpenFilter((prev) => prev === "sort" ? null : "sort")}
                         >
                             <span>排序</span>
-                            <strong>{singleSelectLabel(sortOptions, sortBy, "最新上架")}</strong>
+                            <strong>{singleSelectLabel(sortOptions, sortBy, "创建时间(新-旧)")}</strong>
                             <span className="bsm-market-filter-caret">▼</span>
                         </button>
                         {openFilter === "sort" && (
@@ -434,6 +436,7 @@ export default function MarketFeedPage() {
                             href={`/market/${item.id}`}
                             id={`market-item-${item.id}`}
                             className="bsm-market-card"
+                            prefetch={false}
                         >
                             <div className="bsm-market-img-wrap">
                                 {item.bundled_items && item.bundled_items.length > 1 ? (

@@ -22,6 +22,12 @@ class MarketDetailPageUiTestCase(unittest.TestCase):
         self.assertIn("discountText(item.show_price, item.show_market_price)", content)
         self.assertIn("discountText(listing.show_price, listing.show_market_price)", content)
 
+    def test_market_detail_page_keeps_back_link_prefetch_enabled(self) -> None:
+        content = read_text("src/frontend/src/app/market/[id]/page.tsx")
+
+        self.assertIn('<Link href="/market" className="bsm-link" style={{ fontSize: "0.875rem" }}>', content)
+        self.assertNotIn('<Link href="/market" className="bsm-link" style={{ fontSize: "0.875rem" }} prefetch={false}>', content)
+
 
 if __name__ == "__main__":
     unittest.main()

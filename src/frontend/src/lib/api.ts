@@ -5,6 +5,8 @@
 
 const SAME_DOMAIN_HOSTS = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
 const API_TIMEOUT_MS = 30_000;
+const API_MAX_ATTEMPTS = 3;
+const API_RETRY_BASE_DELAY_MS = 300;
 
 export function authHeaders(extra: HeadersInit = {}): HeadersInit {
     return new Headers(extra);
@@ -55,6 +57,15 @@ async function handleResponse<T>(resp: Response, path: string): Promise<T> {
     return resp.json() as Promise<T>;
 }
 
+class HttpError extends Error {
+    status: number;
+
+    constructor(status: number, message: string) {
+        super(message);
+        this.status = status;
+    }
+}
+
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
@@ -73,46 +84,91 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit): Pr
     }
 }
 
-export async function apiGet<T = unknown>(path: string): Promise<T> {
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}
+
+function retryDelayMs(attempt: number): number {
+    // attempt starts from 1 for the first retry.
+    return API_RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1));
+}
+
+function isRetryableStatus(status: number): boolean {
+    return status === 408 || status === 429 || status >= 500;
+}
+
+function isRetryableError(error: unknown): boolean {
+    if (error instanceof HttpError) {
+        return isRetryableStatus(error.status);
+    }
+    if (error instanceof Error) {
+        const msg = error.message || "";
+        return msg.includes("请求超时") || msg.includes("Failed to fetch") || msg.includes("NetworkError");
+    }
+    return false;
+}
+
+async function requestJsonWithRetry<T>(
+    path: string,
+    init: RequestInit,
+    allowRetry: boolean,
+): Promise<T> {
     const fullPath = apiBase() + path;
-    const resp = await fetchWithTimeout(fullPath, {
+    const maxAttempts = allowRetry ? API_MAX_ATTEMPTS : 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            const resp = await fetchWithTimeout(fullPath, init);
+            if (!resp.ok && isRetryableStatus(resp.status)) {
+                const d = await resp.json().catch(() => ({}));
+                throw new HttpError(resp.status, d.detail || d.error || `HTTP ${resp.status}`);
+            }
+            return await handleResponse<T>(resp, path);
+        } catch (error) {
+            if (attempt >= maxAttempts || !isRetryableError(error)) {
+                throw error;
+            }
+            await sleep(retryDelayMs(attempt));
+        }
+    }
+
+    throw new Error("请求失败");
+}
+
+export async function apiGet<T = unknown>(path: string): Promise<T> {
+    return requestJsonWithRetry<T>(path, {
         method: "GET",
         credentials: "include",
         headers: authHeaders({ Accept: "application/json" }),
-    });
-    return handleResponse<T>(resp, path);
+    }, true);
 }
 
 export async function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
-    const fullPath = apiBase() + path;
-    const resp = await fetchWithTimeout(fullPath, {
+    return requestJsonWithRetry<T>(path, {
         method: "POST",
         credentials: "include",
         headers: authHeaders({ "Content-Type": "application/json", Accept: "application/json" }),
         body: JSON.stringify(body),
-    });
-    return handleResponse<T>(resp, path);
+    }, false);
 }
 
 export async function apiPut<T = unknown>(path: string, body: unknown): Promise<T> {
-    const fullPath = apiBase() + path;
-    const resp = await fetchWithTimeout(fullPath, {
+    return requestJsonWithRetry<T>(path, {
         method: "PUT",
         credentials: "include",
         headers: authHeaders({ "Content-Type": "application/json", Accept: "application/json" }),
         body: JSON.stringify(body),
-    });
-    return handleResponse<T>(resp, path);
+    }, true);
 }
 
 export async function apiDelete<T = unknown>(path: string): Promise<T> {
-    const fullPath = apiBase() + path;
-    const resp = await fetchWithTimeout(fullPath, {
+    return requestJsonWithRetry<T>(path, {
         method: "DELETE",
         credentials: "include",
         headers: authHeaders({ Accept: "application/json" }),
-    });
-    return handleResponse<T>(resp, path);
+    }, true);
 }
 
 // --------------------------------------------------------------------------

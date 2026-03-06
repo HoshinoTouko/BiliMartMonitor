@@ -1,5 +1,40 @@
 # Work Log
 
+## 2026-03-06 Monitor Uptime Logs, Market Sorting Semantics, and Frontend API Retry
+
+### Planned
+
+- Improve runtime observability for Cloudflare container deployments where process state is inferred mostly from logs.
+- Align market sorting behavior and labels so `TIME_DESC` follows creation-time ordering and expose explicit ID ordering.
+- Add frontend retry guardrails to reduce single-request failures from transient network and upstream issues.
+- Keep deployment docs/scripts aligned with long-running container expectations.
+
+### Step Log
+
+1. Extended monitor behavior in `src/backend/main.py` to emit periodic monitor heartbeat lines containing `uptime`, `idle`, and effective check interval (`interval * 12`), while preserving existing restart-on-inactivity logic.
+2. Added retry orchestration to `src/frontend/src/lib/api.ts`:
+   - max 3 attempts with exponential backoff,
+   - retry only on transient classes (`timeout`, network error, `408/429/5xx`),
+   - idempotent methods (`GET/PUT/DELETE`) enabled, `POST` kept single-attempt to avoid duplicate side effects.
+3. Updated backend DB ordering in `src/bsm/db.py`:
+   - `TIME_DESC/TIME_ASC` now map to `created_at` ordering (fallback to `updated_at` for legacy rows),
+   - added explicit `ID_ASC/ID_DESC` branches for market and recent-listing queries.
+4. Updated frontend sort copy/options in market pages to expose `创建时间(新-旧)` and explicit ID sorting choices.
+5. Synced scan-sort default copy across docs/UI (`config.yaml.example`, admin settings page) to `创建时间排序（TIME_DESC，默认）`.
+6. Updated Cloudflare container timeout to `sleepAfter = "720h"` in `cf-worker/index.ts`.
+7. Updated `scripts/run-docker.sh` to default to `--restart unless-stopped` with `RESTART_POLICY` override support; documented usage in `README.md`.
+8. Added/updated regression tests for market sort options, ID ordering behavior, and creation-time TIME sorting behavior.
+9. Tuned Next.js prefetch strategy:
+   - disabled prefetch on `/market` list card links to reduce non-click XHR noise,
+   - kept `/market/[id]` page links on default prefetch behavior.
+
+### Verification
+
+- `pytest -q src/backend/testsuite/test_db.py src/backend/testsuite/test_market_page_ui.py src/backend/testsuite/test_dashboard_ui.py`
+- `pytest -q src/backend/testsuite/test_market_detail_page_ui.py`
+- `pytest -q src/backend/testsuite/test_settings_router.py src/backend/testsuite/test_cron_runner.py`
+- `pnpm -C src/frontend -s exec tsc --noEmit`
+
 ## 2026-03-06 Parallel Category Scan, Session Affinity, and Admin Summary Enhancements
 
 ### Planned

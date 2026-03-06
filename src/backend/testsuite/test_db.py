@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import update
 
 
 PROJECT_ROOT = os.path.abspath(
@@ -16,6 +17,7 @@ if SRC_ROOT not in sys.path:
 
 from bsm import db
 from bsm import settings
+from bsm.orm_models import C2CItem
 
 
 class DatabaseTestCase(unittest.TestCase):
@@ -146,6 +148,62 @@ class DatabaseTestCase(unittest.TestCase):
         listings_desc, _, _ = db.get_recent_15d_listings(50, limit=10, sort_by="PRICE_DESC")
         self.assertEqual(listings_desc[1]["c2c_items_id"], 3003)
         self.assertEqual(listings_desc[2]["c2c_items_id"], 3001)
+
+        listings_id_asc, _, _ = db.get_recent_15d_listings(50, limit=10, sort_by="ID_ASC")
+        self.assertEqual([item["c2c_items_id"] for item in listings_id_asc], [3001, 3002, 3003])
+
+        listings_id_desc, _, _ = db.get_recent_15d_listings(50, limit=10, sort_by="ID_DESC")
+        self.assertEqual([item["c2c_items_id"] for item in listings_id_desc], [3003, 3002, 3001])
+
+    def test_market_time_sort_uses_created_at(self) -> None:
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 3101,
+                    "c2cItemsName": "Item 1",
+                    "price": 10000,
+                    "showPrice": "100.00",
+                    "detailDtoList": [{"itemsId": 51, "marketPrice": 100}],
+                },
+                {
+                    "c2cItemsId": 3102,
+                    "c2cItemsName": "Item 2",
+                    "price": 20000,
+                    "showPrice": "200.00",
+                    "detailDtoList": [{"itemsId": 51, "marketPrice": 100}],
+                },
+                {
+                    "c2cItemsId": 3103,
+                    "c2cItemsName": "Item 3",
+                    "price": 30000,
+                    "showPrice": "300.00",
+                    "detailDtoList": [{"itemsId": 51, "marketPrice": 100}],
+                },
+            ]
+        )
+
+        backend = db._require_sqlalchemy_backend()
+        with backend.session() as session:
+            session.execute(
+                update(C2CItem)
+                .where(C2CItem.c2c_items_id == 3101)
+                .values(created_at="2026-03-01T00:00:00Z", updated_at="2026-03-03T00:00:00Z")
+            )
+            session.execute(
+                update(C2CItem)
+                .where(C2CItem.c2c_items_id == 3102)
+                .values(created_at="2026-03-03T00:00:00Z", updated_at="2026-03-01T00:00:00Z")
+            )
+            session.execute(
+                update(C2CItem)
+                .where(C2CItem.c2c_items_id == 3103)
+                .values(created_at="2026-03-02T00:00:00Z", updated_at="2026-03-02T00:00:00Z")
+            )
+            session.commit()
+
+        items, _, _ = db.list_market_items(limit=10, sort_by="TIME_DESC")
+        ordered_ids = [row["id"] for row in items]
+        self.assertEqual(ordered_ids[:3], [3102, 3103, 3101])
 
     def test_get_product_metadata_and_price_history(self) -> None:
         db.save_items(

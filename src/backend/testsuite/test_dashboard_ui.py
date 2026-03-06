@@ -34,6 +34,7 @@ class DashboardUiTestCase(unittest.TestCase):
         self.assertIn("Cron 已重启并立即执行", content)
         self.assertIn("if (loading || !settings)", content)
         self.assertIn('apiGet("/api/settings/logs?n=50")', content)
+        self.assertIn("创建时间排序（TIME_DESC，默认）", content)
 
     def test_footer_uses_shared_version_and_copyright(self) -> None:
         footer = read_text("src/frontend/src/components/AppFooter.tsx")
