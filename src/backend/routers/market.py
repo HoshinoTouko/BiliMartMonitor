@@ -9,7 +9,7 @@ Routes:
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Depends
+from fastapi import APIRouter, Query, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 import asyncio
@@ -32,12 +32,32 @@ from bsm.db import (  # noqa: E402
     search_market_items,
     save_items,
     load_next_bili_session,
-    _market_item_to_dict,
+    is_item_detail_blob_empty,
     update_item_status,
 )
 from bsm.mall import get_item_detail
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
+
+
+def _hydrate_item_detail_task(item_id: int) -> None:
+    """Best-effort background task: fetch detail and persist product/snapshot mapping."""
+    sess = load_next_bili_session()
+    if not sess or not sess.get("cookies"):
+        return
+    result = get_item_detail(str(sess.get("cookies") or ""), int(item_id))
+    if not result or result.get("code") != 0:
+        return
+    payload = result.get("data")
+    if not isinstance(payload, dict):
+        return
+    if payload.get("c2cItemsId") is None:
+        payload = dict(payload)
+        payload["c2cItemsId"] = int(item_id)
+    try:
+        save_items([payload])
+    except Exception:
+        return
 
 
 @router.get("/api/market/items")
@@ -100,17 +120,25 @@ def api_product_price_history(items_id: int, sku_id: int) -> JSONResponse:
 
 @router.get("/api/market/items/{item_id}/recent-listings")
 def api_item_recent_listings(
+    background_tasks: BackgroundTasks,
     item_id: int, 
     page: int = Query(1, ge=1), 
     limit: int = Query(20, ge=1, le=100),
     sort_by: str = Query("TIME_DESC")
 ) -> JSONResponse:
+    scheduled_hydration = False
+    if is_item_detail_blob_empty(item_id):
+        background_tasks.add_task(_hydrate_item_detail_task, int(item_id))
+        scheduled_hydration = True
     items_id, listings, total_count, total_pages = get_market_item_recent_15d_listings(
         item_id,
         page=page,
         limit=limit,
         sort_by=sort_by,
     )
+    if not items_id:
+        if not scheduled_hydration:
+            background_tasks.add_task(_hydrate_item_detail_task, int(item_id))
     if not items_id:
         return JSONResponse({
             "item_id": item_id, 
@@ -129,8 +157,12 @@ def api_item_recent_listings(
 
 
 @router.get("/api/market/items/{item_id}")
-def api_get_market_item(item_id: int) -> JSONResponse:
+def api_get_market_item(item_id: int, background_tasks: BackgroundTasks) -> JSONResponse:
+    if is_item_detail_blob_empty(item_id):
+        background_tasks.add_task(_hydrate_item_detail_task, int(item_id))
     item = get_market_item(item_id)
+    if item is not None and not item.get("img_url"):
+        background_tasks.add_task(_hydrate_item_detail_task, int(item_id))
     if item is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({"item": item})

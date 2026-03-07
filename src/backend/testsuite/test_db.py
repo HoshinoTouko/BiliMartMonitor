@@ -93,6 +93,23 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(total_pages, 1)
         self.assertEqual(items[0]["id"], 1001)
 
+    def test_save_items_normalizes_default_noface_uface(self) -> None:
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 1002,
+                    "c2cItemsName": "No Face Avatar",
+                    "price": 12000,
+                    "showPrice": "120.00",
+                    "uface": "https://i0.hdslb.com/bfs/face/member/noface.jpg",
+                    "detailDtoList": [{"itemsId": 5002, "skuId": 6002, "marketPrice": 120}],
+                }
+            ]
+        )
+        item = db.get_market_item(1002)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["uface"], "")
+
     def test_market_item_bundled_items(self) -> None:
         db.save_items(
             [
@@ -113,6 +130,106 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertIn("bundled_items", item)
         self.assertEqual(len(item["bundled_items"]), 2)
         self.assertEqual(item["bundled_items"][0]["name"], "item A")
+
+    def test_save_items_merges_sparse_detail_fields_without_losing_existing(self) -> None:
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 9101,
+                    "c2cItemsName": "Merge Detail Fields",
+                    "price": 10000,
+                    "showPrice": "100.00",
+                    "detailDtoList": [
+                        {
+                            "itemsId": 9901,
+                            "skuId": 8801,
+                            "blindBoxId": 7701,
+                            "name": "Original Product",
+                            "imgUrl": "https://example.com/original.png",
+                            "marketPrice": 20000,
+                            "extInfo": {"rarity": "secret"},
+                        }
+                    ],
+                }
+            ]
+        )
+        # Second payload is sparse and lacks imgUrl/extInfo.
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 9101,
+                    "c2cItemsName": "Merge Detail Fields",
+                    "price": 9900,
+                    "showPrice": "99.00",
+                    "detailDtoList": [
+                        {
+                            "itemsId": 9901,
+                            "skuId": 8801,
+                            "blindBoxId": 7701,
+                            "name": "Original Product Renamed",
+                            "marketPrice": 21000,
+                        }
+                    ],
+                }
+            ]
+        )
+
+        backend = db._require_sqlalchemy_backend()
+        with backend.session() as session:
+            row = session.query(C2CItem).filter(C2CItem.c2c_items_id == 9101).first()
+            self.assertIsNotNone(row)
+            details = db._decode_detail_blob(row.detail_blob)
+        self.assertEqual(len(details), 1)
+        merged = details[0]
+        self.assertEqual(merged.get("name"), "Original Product Renamed")
+        self.assertEqual(merged.get("imgUrl"), "https://example.com/original.png")
+        self.assertEqual(merged.get("extInfo"), {"rarity": "secret"})
+
+    def test_save_items_snapshot_follows_materialized_detail_set(self) -> None:
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 9102,
+                    "c2cItemsName": "Snapshot Materialized Detail",
+                    "price": 20000,
+                    "showPrice": "200.00",
+                    "detailDtoList": [
+                        {"itemsId": 9911, "skuId": 8811, "blindBoxId": 7711, "name": "A", "marketPrice": 10000},
+                        {"itemsId": 9912, "skuId": 8812, "blindBoxId": 7712, "name": "B", "marketPrice": 10000},
+                    ],
+                }
+            ]
+        )
+        # Second save only sends one row; materialized detail set should still include both.
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 9102,
+                    "c2cItemsName": "Snapshot Materialized Detail",
+                    "price": 18000,
+                    "showPrice": "180.00",
+                    "detailDtoList": [
+                        {"itemsId": 9911, "skuId": 8811, "blindBoxId": 7711, "name": "A2", "marketPrice": 10000},
+                    ],
+                }
+            ]
+        )
+
+        backend = db._require_sqlalchemy_backend()
+        with backend.session() as session:
+            latest_ts = (
+                session.query(C2CItemSnapshot.snapshot_at)
+                .filter(C2CItemSnapshot.c2c_items_id == 9102)
+                .order_by(C2CItemSnapshot.id.desc())
+                .limit(1)
+                .scalar()
+            )
+            latest_count = (
+                session.query(C2CItemSnapshot)
+                .filter(C2CItemSnapshot.c2c_items_id == 9102, C2CItemSnapshot.snapshot_at == latest_ts)
+                .count()
+            )
+        self.assertEqual(latest_count, 2)
 
     def test_get_recent_15d_listings_sort_by(self) -> None:
         db.save_items(
@@ -317,15 +434,19 @@ class DatabaseTestCase(unittest.TestCase):
         backend = db._require_sqlalchemy_backend()
         with backend.session() as session:
             snapshot_rows = session.query(C2CItemSnapshot).filter(C2CItemSnapshot.c2c_items_id == 4101).all()
-        self.assertEqual(len(snapshot_rows), 3, "Snapshot writes should be append-only")
+        self.assertEqual(
+            len(snapshot_rows),
+            4,
+            "Snapshot writes should be append-only and follow the materialized detail set",
+        )
 
         listings, _, _ = db.get_recent_15d_listings(61, page=1, limit=10, sort_by="TIME_DESC")
         self.assertEqual(len(listings), 1)
         self.assertEqual(listings[0]["c2c_items_id"], 4101)
         self.assertEqual(
             listings[0]["show_est_price"],
-            "100.00",
-            "Estimations must use latest snapshot details only",
+            "10.00",
+            "Estimations should follow the latest materialized detail distribution",
         )
 
     def test_database_backend_uses_sqlalchemy_for_sqlite(self) -> None:
@@ -370,7 +491,7 @@ class DatabaseTestCase(unittest.TestCase):
             "c2cItemsName": "Existing",
             "price": 10000,
             "showPrice": "100.00",
-            "detailDtoList": [],
+            "detailDtoList": [{"itemsId": 8101, "skuId": 8201, "marketPrice": 100}],
         }
         db.save_items([existing])
 
@@ -382,7 +503,7 @@ class DatabaseTestCase(unittest.TestCase):
                     "c2cItemsName": "New",
                     "price": 12000,
                     "showPrice": "120.00",
-                    "detailDtoList": [],
+                    "detailDtoList": [{"itemsId": 8102, "skuId": 8202, "marketPrice": 100}],
                 },
             ]
         )

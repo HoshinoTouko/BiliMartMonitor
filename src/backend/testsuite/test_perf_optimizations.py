@@ -175,18 +175,18 @@ class MarketItemsBatchListingCountTestCase(unittest.TestCase):
         for item in items:
             self.assertEqual(item["recent_listed_count"], 2)
 
-    def test_listing_counts_zero_for_no_details(self) -> None:
-        """Items without detailDtoList should have recent_listed_count=0."""
+    def test_listing_counts_with_single_detail(self) -> None:
+        """Items with one valid detail row should have recent_listed_count=1."""
         db.save_items([{
             "c2cItemsId": 6001,
-            "c2cItemsName": "No Detail Item",
+            "c2cItemsName": "Single Detail Item",
             "price": 5000,
             "showPrice": "50.00",
-            "detailDtoList": [],
+            "detailDtoList": [{"itemsId": 7001, "skuId": 7101, "marketPrice": 100}],
         }])
         items, _, _ = db.list_market_items(page=1, limit=20)
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["recent_listed_count"], 0)
+        self.assertEqual(items[0]["recent_listed_count"], 1)
 
     def test_batch_listing_counts_function(self) -> None:
         """Direct test of get_15d_listing_counts_batch."""

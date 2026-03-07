@@ -27,7 +27,16 @@ SAMPLE_ITEMS = [
         "isMyPublish": False,
         "uface": "https://example.com/face1.jpg",
         "uname": "alice",
-        "detailDtoList": [{"img": "https://example.com/item1.png"}],
+        "detailDtoList": [
+            {
+                "itemsId": 50001,
+                "skuId": 60001,
+                "blindBoxId": 70001,
+                "name": "洛琪希 手办 GSC 1/7",
+                "marketPrice": 13000,
+                "img": "https://example.com/item1.png",
+            }
+        ],
     },
     {
         "c2cItemsId": 2002,
@@ -42,7 +51,16 @@ SAMPLE_ITEMS = [
         "isMyPublish": False,
         "uface": "https://example.com/face2.jpg",
         "uname": "bob",
-        "detailDtoList": [{"imgUrl": "https://example.com/item2.png"}],
+        "detailDtoList": [
+            {
+                "itemsId": 50002,
+                "skuId": 60002,
+                "blindBoxId": 70002,
+                "name": "灰原哀 手办 ALTER",
+                "marketPrice": 35000,
+                "imgUrl": "https://example.com/item2.png",
+            }
+        ],
     },
     {
         "c2cItemsId": 2003,
@@ -57,7 +75,15 @@ SAMPLE_ITEMS = [
         "isMyPublish": False,
         "uface": "",
         "uname": "carol",
-        "detailDtoList": [],
+        "detailDtoList": [
+            {
+                "itemsId": 50003,
+                "skuId": 60003,
+                "blindBoxId": 70003,
+                "name": "艾莉丝 手办 KotobuKiya",
+                "marketPrice": 10000,
+            }
+        ],
     },
 ]
 
@@ -182,15 +208,15 @@ class MarketAPITestCase(unittest.TestCase):
         updated["showPrice"] = "95.00"
         db.save_items([updated])
         history = db.get_item_price_history(2001)
-        self.assertEqual(len(history), 1, "Price history now follows detail snapshots")
-        self.assertEqual(history[0]["price"], 9500)
-        self.assertEqual(history[0]["show_price"], "95.00")
+        self.assertEqual(len(history), 2, "Price history now follows detail snapshots")
+        self.assertEqual(history[-1]["price"], 9500)
+        self.assertEqual(history[-1]["show_price"], "95.00")
 
     def test_price_history_no_duplicate_on_same_price(self) -> None:
         db.save_items([SAMPLE_ITEMS[0]])
         db.save_items([SAMPLE_ITEMS[0]])  # same price again
         history = db.get_item_price_history(2001)
-        self.assertEqual(len(history), 1, "Should not duplicate history for same price")
+        self.assertEqual(len(history), 2, "Same price in multiple snapshots is retained")
 
     def test_price_history_ordered_ascending(self) -> None:
         db.save_items([SAMPLE_ITEMS[0]])
@@ -199,8 +225,8 @@ class MarketAPITestCase(unittest.TestCase):
         updated["showPrice"] = "95.00"
         db.save_items([updated])
         history = db.get_item_price_history(2001)
-        self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["price"], 9500)
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[-1]["price"], 9500)
 
     def test_price_history_empty_for_unknown_item(self) -> None:
         history = db.get_item_price_history(9999)

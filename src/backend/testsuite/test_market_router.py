@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 PROJECT_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..")
@@ -96,7 +97,16 @@ class MarketRouterTestCase(unittest.TestCase):
                 "isMyPublish": False,
                 "uface": "",
                 "uname": "bob",
-                "detailDtoList": [],
+                "detailDtoList": [
+                    {
+                        "itemsId": 51,
+                        "skuId": 5101,
+                        "blindBoxId": 6101,
+                        "name": "灰原哀 手办 ALTER",
+                        "img": "https://example.com/item-bob.png",
+                        "marketPrice": 35000,
+                    }
+                ],
             },
         ]
 
@@ -223,6 +233,90 @@ class MarketRouterTestCase(unittest.TestCase):
         body = resp.json()
         self.assertIn("error", body)
 
+    def test_get_item_hydrates_missing_product_snapshot(self) -> None:
+        self.save_items([self.sample_items[1]])
+        from bsm.db import _require_sqlalchemy_backend
+        from bsm.orm_models import C2CItemSnapshot
+
+        backend = _require_sqlalchemy_backend()
+        with backend.session() as session:
+            session.query(C2CItemSnapshot).filter(C2CItemSnapshot.c2c_items_id == 3002).delete()
+            session.commit()
+        with (
+            patch("backend.routers.market.load_next_bili_session", return_value={"cookies": "test-cookie"}),
+            patch(
+                "backend.routers.market.get_item_detail",
+                return_value={
+                    "code": 0,
+                    "data": {
+                        "c2cItemsId": 3002,
+                        "c2cItemsName": "灰原哀 手办 ALTER",
+                        "price": 28000,
+                        "showPrice": "280.00",
+                        "detailDtoList": [
+                            {
+                                "itemsId": 52002,
+                                "skuId": 62002,
+                                "blindBoxId": 72002,
+                                "name": "灰原哀 手办 ALTER",
+                                "marketPrice": 35000,
+                                "imgUrl": "https://example.com/hydrated-3002.png",
+                            }
+                        ],
+                    },
+                },
+            ),
+        ):
+            first_resp = self.client.get("/api/market/items/3002", auth=self.auth)
+            second_resp = self.client.get("/api/market/items/3002", auth=self.auth)
+        self.assertEqual(first_resp.status_code, 200)
+        self.assertEqual(first_resp.json()["item"]["img_url"], "")
+        self.assertEqual(second_resp.status_code, 200)
+        self.assertEqual(second_resp.json()["item"]["img_url"], "https://example.com/hydrated-3002.png")
+
+    def test_get_item_hydrates_when_detail_blob_empty_even_if_img_exists(self) -> None:
+        self.save_items([self.sample_items[0]])
+        from bsm.db import _require_sqlalchemy_backend
+        from bsm.orm_models import C2CItem
+
+        backend = _require_sqlalchemy_backend()
+        with backend.session() as session:
+            row = session.query(C2CItem).filter(C2CItem.c2c_items_id == 3001).first()
+            self.assertIsNotNone(row)
+            row.detail_blob = None
+            session.commit()
+
+        with (
+            patch("backend.routers.market.load_next_bili_session", return_value={"cookies": "test-cookie"}),
+            patch(
+                "backend.routers.market.get_item_detail",
+                return_value={
+                    "code": 0,
+                    "data": {
+                        "c2cItemsId": 3001,
+                        "c2cItemsName": "洛琪希 手办 GSC",
+                        "price": 10000,
+                        "showPrice": "100.00",
+                        "detailDtoList": [
+                            {
+                                "itemsId": 50,
+                                "skuId": 5001,
+                                "blindBoxId": 7001,
+                                "name": "Test Bundled Item",
+                                "marketPrice": 13000,
+                                "imgUrl": "https://example.com/item-refetched.png",
+                            }
+                        ],
+                    },
+                },
+            ) as mock_fetch_detail,
+        ):
+            first_resp = self.client.get("/api/market/items/3001", auth=self.auth)
+            second_resp = self.client.get("/api/market/items/3001", auth=self.auth)
+        self.assertEqual(first_resp.status_code, 200)
+        self.assertEqual(second_resp.status_code, 200)
+        self.assertGreaterEqual(mock_fetch_detail.call_count, 1)
+
     # ------------------------------------------------------------------
     # GET /api/product/{items_id}/{sku_id}/price-history
     # ------------------------------------------------------------------
@@ -324,6 +418,51 @@ class MarketRouterTestCase(unittest.TestCase):
             # Check price estimations
             self.assertIn("show_est_price", first)
             self.assertIn("show_est_price", first)
+
+    def test_recent_listings_hydrates_when_snapshot_missing(self) -> None:
+        self.save_items([self.sample_items[1]])
+        from bsm.db import _require_sqlalchemy_backend
+        from bsm.orm_models import C2CItemSnapshot
+
+        backend = _require_sqlalchemy_backend()
+        with backend.session() as session:
+            session.query(C2CItemSnapshot).filter(C2CItemSnapshot.c2c_items_id == 3002).delete()
+            session.commit()
+        with (
+            patch("backend.routers.market.load_next_bili_session", return_value={"cookies": "test-cookie"}),
+            patch(
+                "backend.routers.market.get_item_detail",
+                return_value={
+                    "code": 0,
+                    "data": {
+                        "c2cItemsId": 3002,
+                        "c2cItemsName": "灰原哀 手办 ALTER",
+                        "price": 28000,
+                        "showPrice": "280.00",
+                        "detailDtoList": [
+                            {
+                                "itemsId": 52002,
+                                "skuId": 62002,
+                                "blindBoxId": 72002,
+                                "name": "灰原哀 手办 ALTER",
+                                "marketPrice": 35000,
+                                "imgUrl": "https://example.com/hydrated-3002.png",
+                            }
+                        ],
+                    },
+                },
+            ),
+        ):
+            first_resp = self.client.get("/api/market/items/3002/recent-listings", auth=self.auth)
+            second_resp = self.client.get("/api/market/items/3002/recent-listings", auth=self.auth)
+        self.assertEqual(first_resp.status_code, 200)
+        first_body = first_resp.json()
+        self.assertIsNone(first_body["items_id"])
+
+        self.assertEqual(second_resp.status_code, 200)
+        second_body = second_resp.json()
+        self.assertEqual(second_body["items_id"], 52002)
+        self.assertEqual(len(second_body["listings"]), 1)
 
     # ------------------------------------------------------------------
     # Product Endpoint APIs

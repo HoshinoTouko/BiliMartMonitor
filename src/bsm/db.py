@@ -317,6 +317,18 @@ def _sanitize_str(val: Any) -> str:
     return val.strip().strip("`")
 
 
+_DEFAULT_NOFACE_URL = "https://i0.hdslb.com/bfs/face/member/noface.jpg"
+
+
+def _normalize_uface(val: Any) -> str:
+    text = _sanitize_str(val)
+    if not text:
+        return ""
+    if text == _DEFAULT_NOFACE_URL:
+        return ""
+    return text
+
+
 def _json_list(value: Any) -> List[str]:
     if isinstance(value, list):
         raw = value
@@ -514,33 +526,126 @@ def _extract_img_from_detail_items(data: Any) -> str:
     return ""
 
 
-def _parse_bundled_items_from_row(row: Any) -> List[Dict[str, Any]]:
-    bundled_items = _decode_detail_blob(getattr(row, "detail_blob", None))
-    return bundled_items if bundled_items else []
+def _extract_img_from_products(data: Any) -> str:
+    if not isinstance(data, list):
+        return ""
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for key in ("imgUrl", "img", "image"):
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return ""
+
+
+def _detail_item_merge_key(item: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    items_id = item.get("itemsId")
+    sku_id = item.get("skuId")
+    blindbox_id = item.get("blindBoxId")
+    if blindbox_id is None:
+        blindbox_id = item.get("blindboxId")
+    return (items_id, sku_id, blindbox_id)
+
+
+def _merge_detail_list_with_existing(
+    incoming_list: List[Dict[str, Any]],
+    existing_list: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not incoming_list:
+        return []
+    existing_map: Dict[Tuple[Any, Any, Any], Dict[str, Any]] = {}
+    for old_item in existing_list:
+        if not isinstance(old_item, dict):
+            continue
+        existing_map[_detail_item_merge_key(old_item)] = old_item
+
+    merged: List[Dict[str, Any]] = []
+    seen_keys: set[Tuple[Any, Any, Any]] = set()
+    for new_item in incoming_list:
+        if not isinstance(new_item, dict):
+            continue
+        key = _detail_item_merge_key(new_item)
+        old_item = existing_map.get(key, {})
+        merged_item = dict(old_item)
+        merged_item.update(new_item)
+        merged.append(merged_item)
+        seen_keys.add(key)
+    # Keep existing detail rows not present in the incoming partial payload.
+    for old_item in existing_list:
+        if not isinstance(old_item, dict):
+            continue
+        key = _detail_item_merge_key(old_item)
+        if key in seen_keys:
+            continue
+        merged.append(dict(old_item))
+    return merged
 
 
 def _market_item_to_dict(
     row: C2CItem,
     recent_listed_count: int = 0,
+    bundled_items: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    bundled_items = _parse_bundled_items_from_row(row)
+    normalized_bundled_items = bundled_items if isinstance(bundled_items, list) else []
     return {
         "id": row.c2c_items_id,
         "category_id": row.category_id,
         "name": row.c2c_items_name,
         "show_price": row.show_price,
         "show_market_price": row.show_market_price,
-        "uface": row.uface,
+        "uface": _normalize_uface(row.uface),
         "uname": row.uname,
-        "img_url": _extract_img_from_detail_items(bundled_items),
+        "img_url": _extract_img_from_products(normalized_bundled_items),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         "recent_listed_count": recent_listed_count,
-        "bundled_items": bundled_items,
+        "bundled_items": normalized_bundled_items,
         "publish_status": row.publish_status,
         "sale_status": row.sale_status,
         "drop_reason": row.drop_reason,
     }
+
+
+def _load_current_details_for_c2c_ids(c2c_items_ids: Sequence[int]) -> Dict[int, List[Dict[str, Any]]]:
+    if not c2c_items_ids:
+        return {}
+    backend = _require_sqlalchemy_backend()
+    current_details = _current_item_details_subquery("market_item_details_for_ids")
+    with backend.session() as session:
+        rows = session.execute(
+            select(
+                current_details.c.c2c_items_id,
+                current_details.c.items_id,
+                current_details.c.sku_id,
+                current_details.c.name,
+                current_details.c.img_url,
+                current_details.c.market_price,
+                current_details.c.id,
+            )
+            .where(current_details.c.c2c_items_id.in_(list(c2c_items_ids)))
+            .order_by(current_details.c.c2c_items_id.asc(), current_details.c.id.asc())
+        ).all()
+
+    result: Dict[int, List[Dict[str, Any]]] = {}
+    for row in rows:
+        cid = int(row.c2c_items_id)
+        if cid not in result:
+            result[cid] = []
+        result[cid].append(
+            {
+                "itemsId": int(row.items_id) if row.items_id is not None else 0,
+                "skuId": int(row.sku_id) if row.sku_id is not None else 0,
+                "blindBoxId": None,
+                "blindboxId": None,
+                "name": row.name or "",
+                "imgUrl": row.img_url or "",
+                "img": row.img_url or "",
+                "image": row.img_url or "",
+                "marketPrice": int(row.market_price) if row.market_price is not None else None,
+            }
+        )
+    return result
 
 
 def _latest_snapshot_subquery(name: str = "latest_snapshot"):
@@ -709,11 +814,20 @@ def _load_market_items_page(
     page_ids = [int(row[0].c2c_items_id) for row in rows if row[0] is not None]
     listing_counts = get_15d_listing_counts_batch(page_ids) if page_ids else {}
 
-    items = [
-        _market_item_to_dict(row[0], listing_counts.get(int(row[0].c2c_items_id), 0))
-        for row in rows
-        if row[0] is not None
-    ]
+    details_map = _load_current_details_for_c2c_ids(page_ids) if page_ids else {}
+
+    items = []
+    for row in rows:
+        if row[0] is None:
+            continue
+        cid = int(row[0].c2c_items_id)
+        items.append(
+            _market_item_to_dict(
+                row[0],
+                listing_counts.get(cid, 0),
+                details_map.get(cid, []),
+            )
+        )
     return items, total_count, total_pages
 
 
@@ -745,7 +859,6 @@ def _load_recent_15d_listings_page(
             C2CItem.uname.label("uname"),
             C2CItem.created_at.label("created_at"),
             C2CItem.updated_at.label("updated_at"),
-            C2CItem.detail_blob.label("detail_blob"),
             C2CItem.publish_status.label("publish_status"),
             C2CItem.sale_status.label("sale_status"),
             C2CItem.drop_reason.label("drop_reason"),
@@ -766,7 +879,6 @@ def _load_recent_15d_listings_page(
         C2CItem.uname,
         C2CItem.created_at,
         C2CItem.updated_at,
-        C2CItem.detail_blob,
         C2CItem.publish_status,
         C2CItem.sale_status,
         C2CItem.drop_reason,
@@ -804,7 +916,6 @@ def _load_recent_15d_listings_page(
                 paged_rows.c.uname,
                 paged_rows.c.created_at,
                 paged_rows.c.updated_at,
-                paged_rows.c.detail_blob,
                 paged_rows.c.publish_status,
                 paged_rows.c.sale_status,
                 paged_rows.c.drop_reason,
@@ -819,12 +930,14 @@ def _load_recent_15d_listings_page(
     resolved_items_id = int(rows[0].items_id) if rows and rows[0].items_id is not None else None
     total_count = int(rows[0].total_count) if rows else 0
     total_pages = (total_count + limit - 1) // limit if total_count > 0 else 0
+    listing_ids = [int(row.c2c_items_id) for row in rows if row.c2c_items_id is not None]
+    details_map = _load_current_details_for_c2c_ids(listing_ids) if listing_ids else {}
 
     listings: List[Dict[str, Any]] = []
     for row in rows:
         if row.c2c_items_id is None:
             continue
-        bundled_items = _parse_bundled_items_from_row(row)
+        bundled_items = details_map.get(int(row.c2c_items_id), [])
         est_price = row.est_price
         listings.append(
             {
@@ -832,7 +945,7 @@ def _load_recent_15d_listings_page(
                 "name": row.name,
                 "show_price": row.show_price,
                 "show_market_price": row.show_market_price,
-                "uface": row.uface,
+                "uface": _normalize_uface(row.uface),
                 "uname": row.uname,
                 "created_at": row.created_at,
                 "updated_at": row.updated_at,
@@ -1455,52 +1568,32 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                     session.add(row)
                     existing_rows[item_id] = row
 
-                category_id = _sanitize_str(it.get("categoryId"))
-                if category_id is not None:
-                    row.category_id = category_id
-                row.type = it.get("type", row.type if row else None)
-                row.c2c_items_name = it.get("c2cItemsName", row.c2c_items_name if row else None)
-                row.total_items_count = it.get("totalItemsCount", row.total_items_count if row else None)
-                row.price = new_price if new_price is not None else (row.price if row else None)
-                row.show_price = it.get("showPrice", row.show_price if row else None)
-                row.show_market_price = it.get("showMarketPrice", row.show_market_price if row else None)
-                row.uid = it.get("uid", row.uid if row else None)
-                row.payment_time = it.get("paymentTime", row.payment_time if row else None)
-                if "isMyPublish" in it:
-                    row.is_my_publish = 1 if it.get("isMyPublish") else 0
-                row.uface = _sanitize_str(it.get("uface")) or (row.uface if row else None)
-                row.uname = it.get("uname", row.uname if row else None)
-                row.publish_status = it.get("publishStatus")
-                row.sale_status = it.get("saleStatus")
-                row.drop_reason = _sanitize_str(it.get("dropReason"))
                 detail_list = it.get("detailDtoList", [])
                 if not isinstance(detail_list, list):
                     detail_list = []
+                existing_detail_list: List[Dict[str, Any]] = []
+                if row is not None and getattr(row, "detail_blob", None):
+                    existing_detail_list = _decode_detail_blob(getattr(row, "detail_blob", None))
+                materialized_detail_list: List[Dict[str, Any]] = []
                 if "detailDtoList" in it:
-                    encoded_blob = _encode_detail_blob(detail_list)
-                    if is_cloudflare:
-                        pending_detail_blob_updates.append((item_id, encoded_blob.hex()))
+                    if detail_list:
+                        materialized_detail_list = _merge_detail_list_with_existing(detail_list, existing_detail_list)
                     else:
-                        row.detail_blob = encoded_blob
+                        materialized_detail_list = existing_detail_list
                 elif is_new:
-                    encoded_blob = _encode_detail_blob([])
-                    if is_cloudflare:
-                        pending_detail_blob_updates.append((item_id, encoded_blob.hex()))
-                    else:
-                        row.detail_blob = encoded_blob
-                row.updated_at = timestamp
-                if is_new:
-                    row.created_at = timestamp
+                    materialized_detail_list = []
+                else:
+                    materialized_detail_list = existing_detail_list
 
                 details_snapshot_at = _snapshot_now()
                 total_market_price = 0
-                for d_item in detail_list:
+                for d_item in materialized_detail_list:
                     try:
                         total_market_price += int(d_item.get("marketPrice", 0) or 0)
                     except Exception:
                         continue
 
-                for d_item in detail_list:
+                for d_item in materialized_detail_list:
                     d_items_id = d_item.get("itemsId")
                     if not d_items_id:
                         continue
@@ -1568,6 +1661,36 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                             est_price=est_price,
                         )
                     )
+
+                # Persist market row after product/snapshot are materialized from the same detail payload.
+                category_id = _sanitize_str(it.get("categoryId"))
+                if category_id is not None:
+                    row.category_id = category_id
+                row.type = it.get("type", row.type if row else None)
+                row.c2c_items_name = it.get("c2cItemsName", row.c2c_items_name if row else None)
+                row.total_items_count = it.get("totalItemsCount", row.total_items_count if row else None)
+                row.price = new_price if new_price is not None else (row.price if row else None)
+                row.show_price = it.get("showPrice", row.show_price if row else None)
+                row.show_market_price = it.get("showMarketPrice", row.show_market_price if row else None)
+                row.uid = it.get("uid", row.uid if row else None)
+                row.payment_time = it.get("paymentTime", row.payment_time if row else None)
+                if "isMyPublish" in it:
+                    row.is_my_publish = 1 if it.get("isMyPublish") else 0
+                incoming_uface = _normalize_uface(it.get("uface"))
+                row.uface = incoming_uface or (row.uface if row else None)
+                row.uname = it.get("uname", row.uname if row else None)
+                row.publish_status = it.get("publishStatus")
+                row.sale_status = it.get("saleStatus")
+                row.drop_reason = _sanitize_str(it.get("dropReason"))
+                if "detailDtoList" in it or is_new:
+                    encoded_blob = _encode_detail_blob(materialized_detail_list)
+                    if is_cloudflare:
+                        pending_detail_blob_updates.append((item_id, encoded_blob.hex()))
+                    else:
+                        row.detail_blob = encoded_blob
+                row.updated_at = timestamp
+                if is_new:
+                    row.created_at = timestamp
 
                 saved += 1
                 if is_new:
@@ -2117,10 +2240,24 @@ def get_market_item(c2c_items_id: int) -> Optional[Dict[str, Any]]:
         ).first()
     if row is None or row[0] is None:
         return None
+    details_map = _load_current_details_for_c2c_ids([int(c2c_items_id)])
     return _market_item_to_dict(
         row[0],
         int(row.recent_listed_count or 0),
+        details_map.get(int(c2c_items_id), []),
     )
+
+
+def is_item_detail_blob_empty(c2c_items_id: int) -> bool:
+    backend = _require_sqlalchemy_backend()
+    with backend.session() as session:
+        row = session.scalar(
+            select(C2CItem).where(C2CItem.c2c_items_id == c2c_items_id)
+        )
+    if row is None:
+        return True
+    detail_list = _decode_detail_blob(getattr(row, "detail_blob", None))
+    return len(detail_list) == 0
 
 def get_15d_listing_count(items_id: int) -> int:
     """Return the number of distinct c2c listings containing the official items_id in the last 15 days."""

@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.9.5] — 2026-03-08
+
+### Added
+
+- **Scan Log Capture**: Added user-provided scan payload snapshot for debugging at `doc/scan-log-2026-03-08.json`.
+
+### Changed
+
+- **`save_items` Write Order**: Reworked `save_items` to materialize detail payload first, then upsert `product`, then build `c2c_items_snapshot`, and finally persist `c2c_items` (including `detail_blob`) in the same transaction.
+- **Detail Merge Semantics**: Incremental detail writes now preserve unmatched existing detail rows while overriding matched rows by key `(itemsId, skuId, blindBoxId)`.
+- **Avatar Normalization**: Normalize default Bilibili fallback avatar (`https://i0.hdslb.com/bfs/face/member/noface.jpg`) to empty string at write/read paths.
+- **Market On-Access Hydration**: Item/recent-listing routes trigger asynchronous background detail hydration when item `detail_blob` is semantically empty.
+
+### Tests
+
+- Updated router/api/db/perf/refresh tests to use non-empty realistic `detailDtoList` payloads.
+- Added DB regression tests for:
+  - sparse detail merge preserving existing fields,
+  - snapshot generation following the materialized detail set,
+  - default `noface` avatar normalization.
+- Verified suite:
+  - `test_db.py`
+  - `test_market_api.py`
+  - `test_market_router.py`
+  - `test_refresh_api.py`
+  - `test_perf_optimizations.py`
+  - Result: `79 passed`
+
 ## [0.9.4] — 2026-03-07
 
 ### Added

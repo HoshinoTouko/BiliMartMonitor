@@ -1,0 +1,41 @@
+{
+  "note": "User-provided scan log captured on 2026-03-08",
+  "raw": {
+    "success": true,
+    "data": {
+      "data": [
+        {
+          "c2cItemsId": 196155060779,
+          "type": 1,
+          "c2cItemsName": "云翼云 普通版（不含屏风底座） 正比手办",
+          "detailDtoList": [
+            {
+              "blindBoxId": 238240710,
+              "itemsId": 12450141,
+              "skuId": 1014409647,
+              "name": "云翼云 普通版（不含屏风底座） 正比手办",
+              "img": "//i0.hdslb.com/bfs/mall/mall/f6/0a/f60a0a9d29d3ac384800c3666d032370.png",
+              "marketPrice": 25900,
+              "type": 1,
+              "isHidden": false
+            }
+          ],
+          "totalItemsCount": 1,
+          "price": 12900,
+          "showPrice": "129",
+          "showMarketPrice": "259",
+          "uid": "27***2",
+          "paymentTime": 0,
+          "isMyPublish": false,
+          "uspaceJumpUrl": null,
+          "uface": "https://i0.hdslb.com/bfs/face/e2f98c2dc1984efbd47e263236121020d176b971.jpg",
+          "uname": "B***"
+        }
+      ],
+      "nextId": "eB7ltIhDGvGvN/DZePCITzDF4P3B/WZZ/7RCX0rEhxs="
+    },
+    "header": null,
+    "code": 0,
+    "message": "success"
+  }
+}

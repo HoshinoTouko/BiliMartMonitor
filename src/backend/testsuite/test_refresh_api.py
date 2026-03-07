@@ -42,7 +42,7 @@ class RefreshApiTestCase(unittest.TestCase):
                 "publishStatus": 2,
                 "saleStatus": 1,
                 "dropReason": "手动下架",
-                "detailDtoList": [],
+                "detailDtoList": [{"itemsId": 9001, "skuId": 9101, "marketPrice": 100}],
             },
         }
 
@@ -80,7 +80,7 @@ class RefreshApiTestCase(unittest.TestCase):
                     "publishStatus": 2,
                     "saleStatus": 1,
                     "dropReason": "手动下架",
-                    "detailDtoList": [],
+                    "detailDtoList": [{"itemsId": 9001, "skuId": 9101, "marketPrice": 100}],
                 },
             }
 
