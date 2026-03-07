@@ -108,7 +108,7 @@ class DatabaseTestCase(unittest.TestCase):
         )
         item = db.get_market_item(1002)
         self.assertIsNotNone(item)
-        self.assertEqual(item["uface"], "")
+        self.assertEqual(item["uface"], "https://i0.hdslb.com/bfs/face/member/noface.jpg")
 
     def test_market_item_bundled_items(self) -> None:
         db.save_items(

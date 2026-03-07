@@ -329,6 +329,12 @@ def _normalize_uface(val: Any) -> str:
     return text
 
 
+def _serialize_uface(val: Any) -> str:
+    """Always return a usable avatar URL in API responses."""
+    normalized = _normalize_uface(val)
+    return normalized or _DEFAULT_NOFACE_URL
+
+
 def _json_list(value: Any) -> List[str]:
     if isinstance(value, list):
         raw = value
@@ -594,7 +600,7 @@ def _market_item_to_dict(
         "name": row.c2c_items_name,
         "show_price": row.show_price,
         "show_market_price": row.show_market_price,
-        "uface": _normalize_uface(row.uface),
+        "uface": _serialize_uface(row.uface),
         "uname": row.uname,
         "img_url": _extract_img_from_products(normalized_bundled_items),
         "created_at": row.created_at,
@@ -945,7 +951,7 @@ def _load_recent_15d_listings_page(
                 "name": row.name,
                 "show_price": row.show_price,
                 "show_market_price": row.show_market_price,
-                "uface": _normalize_uface(row.uface),
+                "uface": _serialize_uface(row.uface),
                 "uname": row.uname,
                 "created_at": row.created_at,
                 "updated_at": row.updated_at,
@@ -1550,7 +1556,6 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
             ).all()
             existing_rows = {int(row.c2c_items_id): row for row in rows}
 
-        snapshot_models: List[C2CItemSnapshot] = []
         pending_detail_blob_updates: List[Tuple[int, str]] = []
 
         for it in items:
@@ -1559,11 +1564,16 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                 continue
             try:
                 item_id = int(item_id)
+            except Exception:
+                continue
+
+            try:
                 new_price = it.get("price")
                 timestamp = _now()
                 row = existing_rows.get(item_id)
                 is_new = row is None
                 if row is None:
+                    # Keep a minimal parent row so snapshot FK can be created in this transaction.
                     row = C2CItem(c2c_items_id=item_id)
                     session.add(row)
                     existing_rows[item_id] = row
@@ -1572,7 +1582,7 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                 if not isinstance(detail_list, list):
                     detail_list = []
                 existing_detail_list: List[Dict[str, Any]] = []
-                if row is not None and getattr(row, "detail_blob", None):
+                if getattr(row, "detail_blob", None):
                     existing_detail_list = _decode_detail_blob(getattr(row, "detail_blob", None))
                 materialized_detail_list: List[Dict[str, Any]] = []
                 if "detailDtoList" in it:
@@ -1593,6 +1603,8 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                     except Exception:
                         continue
 
+                # Write order: product -> snapshot -> c2c_items/blob.
+                item_snapshot_models: List[C2CItemSnapshot] = []
                 for d_item in materialized_detail_list:
                     d_items_id = d_item.get("itemsId")
                     if not d_items_id:
@@ -1627,8 +1639,6 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                             est_price = int(float(new_price) * float(parsed_market_price) / float(total_market_price))
                         except Exception:
                             est_price = None
-                    # Legacy payloads may not carry blindBoxId/skuId; use 0 placeholders
-                    # to keep snapshot->product linkage complete during migration.
                     if parsed_blindbox_id is None:
                         parsed_blindbox_id = 0
                     if parsed_sku_id is None:
@@ -1653,7 +1663,7 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                     existing_product.img_url = _extract_img_from_detail_items([d_item])
                     existing_product.market_price = parsed_market_price
                     existing_product.updated_at = timestamp
-                    snapshot_models.append(
+                    item_snapshot_models.append(
                         C2CItemSnapshot(
                             c2c_items_id=item_id,
                             snapshot_at=details_snapshot_at,
@@ -1661,8 +1671,10 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                             est_price=est_price,
                         )
                     )
+                if item_snapshot_models:
+                    session.add_all(item_snapshot_models)
+                    session.flush()
 
-                # Persist market row after product/snapshot are materialized from the same detail payload.
                 category_id = _sanitize_str(it.get("categoryId"))
                 if category_id is not None:
                     row.category_id = category_id
@@ -1697,9 +1709,6 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                     inserted += 1
             except Exception:
                 continue
-
-        if snapshot_models:
-            session.add_all(snapshot_models)
 
         if is_cloudflare and pending_detail_blob_updates:
             # D1 JSON transport may coerce bytes params to TEXT; use SQL BLOB literal.

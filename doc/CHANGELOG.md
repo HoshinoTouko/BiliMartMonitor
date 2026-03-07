@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.9.5] — 2026-03-08
+## [0.9.5.1] — 2026-03-08
 
 ### Added
 
@@ -8,9 +8,9 @@
 
 ### Changed
 
-- **`save_items` Write Order**: Reworked `save_items` to materialize detail payload first, then upsert `product`, then build `c2c_items_snapshot`, and finally persist `c2c_items` (including `detail_blob`) in the same transaction.
-- **Detail Merge Semantics**: Incremental detail writes now preserve unmatched existing detail rows while overriding matched rows by key `(itemsId, skuId, blindBoxId)`.
-- **Avatar Normalization**: Normalize default Bilibili fallback avatar (`https://i0.hdslb.com/bfs/face/member/noface.jpg`) to empty string at write/read paths.
+- **`save_items` Write Order**: Enforced write sequence as `product -> c2c_items_snapshot -> c2c_items/detail_blob`.
+- **Avatar Serialization**: API responses now always return a usable `uface`; empty/default-normalized values are serialized to Bilibili's `noface` URL.
+- **Detail Merge Semantics**: Incremental detail writes preserve unmatched existing detail rows while overriding matched rows by key `(itemsId, skuId, blindBoxId)`.
 - **Market On-Access Hydration**: Item/recent-listing routes trigger asynchronous background detail hydration when item `detail_blob` is semantically empty.
 
 ### Tests
@@ -19,14 +19,14 @@
 - Added DB regression tests for:
   - sparse detail merge preserving existing fields,
   - snapshot generation following the materialized detail set,
-  - default `noface` avatar normalization.
+  - API serialization fallback for empty seller avatar (`uface`).
 - Verified suite:
   - `test_db.py`
   - `test_market_api.py`
   - `test_market_router.py`
-  - `test_refresh_api.py`
+  - `test_dashboard_ui.py`
   - `test_perf_optimizations.py`
-  - Result: `79 passed`
+  - Result: `80 passed`
 
 ## [0.9.4] — 2026-03-07
 

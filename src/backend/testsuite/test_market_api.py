@@ -122,6 +122,11 @@ class MarketAPITestCase(unittest.TestCase):
         self.assertEqual(total_count, 3)
         self.assertEqual(len(items), 3)
         self.assertEqual([it["id"] for it in items], [2003, 2002, 2001])
+        by_id = {it["id"]: it for it in items}
+        self.assertEqual(
+            by_id[2003]["uface"],
+            "https://i0.hdslb.com/bfs/face/member/noface.jpg",
+        )
 
     def test_list_market_items_pagination(self) -> None:
         db.save_items(SAMPLE_ITEMS)
