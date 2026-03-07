@@ -8,6 +8,7 @@ import concurrent.futures
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -35,6 +36,26 @@ _CATEGORY_LABELS = {
 _SCAN_NOW_EVENT: asyncio.Event | None = None
 _CRON_LOOP: asyncio.AbstractEventLoop | None = None
 _SCAN_PROGRESS_LOADED = False
+_WAIT_PREFIX = "[WAIT]"
+_EXEC_PREFIX = "[EXEC]"
+
+
+def _log_wait(msg: str, level: str = "info") -> None:
+    if level == "error":
+        cron_state.error(f"{_WAIT_PREFIX} {msg}")
+    elif level == "warn":
+        cron_state.warn(f"{_WAIT_PREFIX} {msg}")
+    else:
+        cron_state.info(f"{_WAIT_PREFIX} {msg}")
+
+
+def _log_exec(msg: str, level: str = "info") -> None:
+    if level == "error":
+        cron_state.error(f"{_EXEC_PREFIX} {msg}")
+    elif level == "warn":
+        cron_state.warn(f"{_EXEC_PREFIX} {msg}")
+    else:
+        cron_state.info(f"{_EXEC_PREFIX} {msg}")
 
 
 def _mode_log_label(mode: str) -> str:
@@ -224,7 +245,7 @@ def request_scan_now() -> bool:
     if _CRON_LOOP is None or _SCAN_NOW_EVENT is None:
         return False
     _CRON_LOOP.call_soon_threadsafe(_SCAN_NOW_EVENT.set)
-    cron_state.info("已手动触发下一次扫描")
+    _log_wait("已手动触发下一次扫描")
     return True
 
 
@@ -236,7 +257,7 @@ def reset_scan_progress() -> None:
     _CATEGORY_SESSION_BINDINGS.clear()
     _CATEGORY_SLEEP_STATE.clear()
     _save_scan_progress()
-    cron_state.info("扫描进度已重置")
+    _log_wait("扫描进度已重置")
 
 
 def _category_sleep_entry(category: str | None) -> dict[str, int]:
@@ -358,7 +379,7 @@ def _run_scan_once() -> dict:
     raw_sessions = list_bili_sessions(status="active")
     available_sessions = [session for session in raw_sessions if _is_session_available(session, cooldown_seconds)]
     if not available_sessions:
-        cron_state.warn("跳过：无可用 session，请先登录")
+        _log_wait("跳过：无可用 session，请先登录", level="warn")
         return {"skip": True, "interval": interval, "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds}
 
     active_categories: list[str | None] = []
@@ -367,7 +388,7 @@ def _run_scan_once() -> dict:
             active_categories.append(category)
         else:
             remaining = _category_sleep_entry(category).get("remaining", 0)
-            cron_state.info(f"分类 {_category_label(category)} 休眠中，剩余 {remaining} 轮")
+            _log_wait(f"分类 {_category_label(category)} 休眠中，剩余 {remaining} 轮")
 
     if not active_categories:
         return {"skip": True, "interval": interval, "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds}
@@ -376,7 +397,7 @@ def _run_scan_once() -> dict:
     mode_label = _mode_log_label(mode)
     for category, sess in assignments:
         page = _mode_page(mode, category)
-        cron_state.info(
+        _log_exec(
             f"开始扫描 | 账号 {str(sess.get('login_username') or '未知')} | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页"
         )
 
@@ -397,6 +418,7 @@ def _run_scan_once() -> dict:
                     "category": category,
                     "session": sess,
                     "page": _mode_page(mode, category),
+                    "started_at": time.perf_counter(),
                 }
             for future, meta in future_map.items():
                 try:
@@ -416,6 +438,7 @@ def _run_scan_once() -> dict:
                     meta["error"] = str(e)
                     meta["items"] = []
                     meta["next_id"] = None
+                meta["duration_ms"] = int((time.perf_counter() - float(meta.get("started_at") or time.perf_counter())) * 1000)
                 category_jobs.append(meta)
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
@@ -436,10 +459,14 @@ def _run_scan_once() -> dict:
             session = job["session"]
             username = str(session.get("login_username") or "")
             error = str(job.get("error") or "").strip()
+            duration_ms = int(job.get("duration_ms") or 0)
             if error:
                 any_error = any_error or error
                 session_errors[username] = error
-                cron_state.error(f"扫描出错 | 账号 {username or '未知'} | 分类 {_category_label(category)} | {error}")
+                _log_exec(
+                    f"扫描出错 | 账号 {username or '未知'} | 分类 {_category_label(category)} | 耗时 {duration_ms} ms | {error}",
+                    level="error",
+                )
                 send_admin_telegram_alert(
                     f"系统告警\n类型: 扫描异常\n账号: {username or '未知'}\n分类: {_category_label(category)}\n详情: {error}",
                     cfg,
@@ -472,7 +499,7 @@ def _run_scan_once() -> dict:
 
             sleep_level = _update_category_sleep_state(category, first_page_repeat)
             if sleep_level > 0:
-                cron_state.info(f"分类 {_category_label(category)} 第1页命中重复，休眠 {sleep_level} 轮")
+                _log_wait(f"分类 {_category_label(category)} 第1页命中重复，休眠 {sleep_level} 轮")
 
             summary_rows.append({
                 "category_key": _category_key(category),
@@ -480,11 +507,12 @@ def _run_scan_once() -> dict:
                 "count": len(items),
                 "inserted": int(inserted),
                 "did_reset_cursor": did_reset_cursor,
+                "duration_ms": duration_ms,
             })
-            cron_state.info(
-                f"扫描完成 | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | {len(items)} 条 | 新增 {inserted} 条"
+            _log_exec(
+                f"扫描完成 | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | {len(items)} 条 | 新增 {inserted} 条 | 耗时 {duration_ms} ms"
             )
-            cron_state.info(f"下次扫描 | 分类 {_category_label(category)} | 第 {_mode_page(mode, category)} 页")
+            _log_wait(f"下次扫描 | 分类 {_category_label(category)} | 第 {_mode_page(mode, category)} 页")
             if username and username not in session_errors:
                 session_success_count[username] = session_success_count.get(username, 0) + len(items)
 
@@ -504,7 +532,7 @@ def _run_scan_once() -> dict:
             notifier = load_notifier(cfg.get("notify"))
             notifier.notify_batch(notify_items, cfg, set())
         except Exception as ne:
-            cron_state.warn(f"通知发送失败: {ne}")
+            _log_exec(f"通知发送失败: {ne}", level="warn")
 
         return {
             "skip": False,
@@ -517,7 +545,7 @@ def _run_scan_once() -> dict:
             "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds,
         }
     except Exception as e:
-        cron_state.error(f"扫描出错: {e}")
+        _log_exec(f"扫描出错: {e}", level="error")
         send_admin_telegram_alert(f"系统告警\n类型: 扫描异常\n详情: {e}", cfg)
         return {
             "skip": False,
@@ -541,7 +569,7 @@ async def cron_loop() -> None:
     admin_summary_interval_seconds = _ADMIN_SCAN_SUMMARY_INTERVAL_SECONDS
     next_admin_summary_at = _CRON_LOOP.time() + admin_summary_interval_seconds
     admin_summary_bucket: dict[str, dict[str, int | str]] = {}
-    cron_state.info("后台扫描任务已启动")
+    _log_wait("后台扫描任务已启动")
 
     while True:
         cron_state.set_next_scan_in(None)
@@ -550,7 +578,7 @@ async def cron_loop() -> None:
         except asyncio.CancelledError:
             break
         except Exception as e:
-            cron_state.error(f"未预期错误: {e}")
+            _log_exec(f"未预期错误: {e}", level="error")
             try:
                 from bsm.notify import send_admin_telegram_alert
                 send_admin_telegram_alert(f"系统告警\n类型: 后台任务异常\n详情: {e}")
@@ -580,19 +608,19 @@ async def cron_loop() -> None:
             admin_summary_interval_seconds = configured_admin_interval
             next_admin_summary_at = now + admin_summary_interval_seconds
             admin_summary_bucket.clear()
-            cron_state.info(f"管理员扫描汇总推送周期已更新为 {int(admin_summary_interval_seconds)} 秒")
+            _log_wait(f"管理员扫描汇总推送周期已更新为 {int(admin_summary_interval_seconds)} 秒")
         if now >= next_admin_summary_at:
             from bsm.notify import send_admin_telegram_alert
 
             summary_message = _build_admin_scan_summary_message(admin_summary_bucket)
             sent = send_admin_telegram_alert(summary_message)
-            cron_state.info(f"10分钟扫描汇总已推送（{sent}）")
+            _log_wait(f"10分钟扫描汇总已推送（{sent}）")
             admin_summary_bucket.clear()
             while next_admin_summary_at <= now:
                 next_admin_summary_at += admin_summary_interval_seconds
 
         interval = float(result.get("interval", 20))
-        cron_state.info(f"等待 {int(interval)} 秒")
+        _log_wait(f"等待 {int(interval)} 秒")
 
         try:
             deadline = _CRON_LOOP.time() + interval
@@ -614,4 +642,4 @@ async def cron_loop() -> None:
     cron_state.is_running = False
     _CRON_LOOP = None
     _SCAN_NOW_EVENT = None
-    cron_state.info("后台扫描任务已停止")
+    _log_wait("后台扫描任务已停止")
