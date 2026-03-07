@@ -7,11 +7,13 @@ import urllib.parse
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import sqlalchemy as sa
-from sqlalchemy import and_, case, create_engine, delete, event, func, literal, or_, select, true, union_all
+from sqlalchemy import and_, case, create_engine, delete, event, func, literal, or_, select, true
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, aliased, sessionmaker
 from .env import data_dir, env_int, env_str, load_dotenv, resolve_project_path
@@ -21,7 +23,6 @@ from .orm_models import (
     BiliSession,
     C2CItem,
     C2CItemDetail,
-    C2CPriceHistory,
 )
 
 
@@ -53,6 +54,11 @@ def _utc_cutoff(*, seconds: int = 0, hours: int = 0, days: int = 0) -> str:
     return (datetime.now(timezone.utc) - timedelta(seconds=seconds, hours=hours, days=days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+
+
+def _snapshot_now() -> str:
+    """Use microsecond precision to avoid snapshot timestamp collisions."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _load_bili_session_runtime_settings() -> Dict[str, Any]:
@@ -229,9 +235,25 @@ class SqlalchemyBackend(DatabaseBackend):
         with self._engine.begin() as conn:
             Base.metadata.create_all(bind=conn)
             inspector = sa.inspect(conn)
-            columns = {column["name"] for column in inspector.get_columns("c2c_items")}
-            if "category_id" not in columns:
+            item_columns = {column["name"] for column in inspector.get_columns("c2c_items")}
+            if "category_id" not in item_columns:
                 conn.execute(sa.text("ALTER TABLE c2c_items ADD COLUMN category_id TEXT"))
+            detail_columns = {column["name"] for column in inspector.get_columns("c2c_items_details")}
+            if "snapshot_at" not in detail_columns:
+                conn.execute(sa.text("ALTER TABLE c2c_items_details ADD COLUMN snapshot_at TEXT"))
+            conn.execute(
+                sa.text(
+                    """
+                    UPDATE c2c_items_details
+                    SET snapshot_at = COALESCE(
+                        snapshot_at,
+                        (SELECT COALESCE(c2c_items.updated_at, c2c_items.created_at) FROM c2c_items WHERE c2c_items.c2c_items_id = c2c_items_details.c2c_items_id),
+                        CURRENT_TIMESTAMP
+                    )
+                    WHERE snapshot_at IS NULL OR TRIM(snapshot_at) = ''
+                    """
+                )
+            )
 
     def _is_sqlite(self) -> bool:
         return self.db_url.startswith("sqlite:///")
@@ -400,20 +422,55 @@ def _market_item_to_dict(
     }
 
 
+def _latest_detail_snapshot_subquery(name: str = "latest_detail_snapshot"):
+    return (
+        select(
+            C2CItemDetail.c2c_items_id.label("c2c_items_id"),
+            func.max(C2CItemDetail.snapshot_at).label("snapshot_at"),
+        )
+        .group_by(C2CItemDetail.c2c_items_id)
+        .subquery(name)
+    )
+
+
+def _current_item_details_subquery(name: str = "current_item_details"):
+    latest_snapshot = _latest_detail_snapshot_subquery(f"{name}_latest")
+    return (
+        select(
+            C2CItemDetail.id.label("id"),
+            C2CItemDetail.c2c_items_id.label("c2c_items_id"),
+            C2CItemDetail.items_id.label("items_id"),
+            C2CItemDetail.name.label("name"),
+            C2CItemDetail.img_url.label("img_url"),
+            C2CItemDetail.market_price.label("market_price"),
+            C2CItemDetail.snapshot_at.label("snapshot_at"),
+        )
+        .join(
+            latest_snapshot,
+            and_(
+                C2CItemDetail.c2c_items_id == latest_snapshot.c.c2c_items_id,
+                C2CItemDetail.snapshot_at == latest_snapshot.c.snapshot_at,
+            ),
+        )
+        .subquery(name)
+    )
+
+
 def _market_recent_listing_count_expr(cutoff: Optional[str] = None):
     cutoff_value = cutoff or _utc_cutoff(days=15)
     recent_item = aliased(C2CItem)
+    current_details = _current_item_details_subquery("market_recent_current_details")
     primary_items_sq = (
-        select(func.min(C2CItemDetail.items_id))
-        .where(C2CItemDetail.c2c_items_id == C2CItem.c2c_items_id)
+        select(func.min(current_details.c.items_id))
+        .where(current_details.c.c2c_items_id == C2CItem.c2c_items_id)
         .correlate(C2CItem)
         .scalar_subquery()
     )
     return (
-        select(func.count(func.distinct(C2CItemDetail.c2c_items_id)))
-        .select_from(C2CItemDetail)
-        .join(recent_item, recent_item.c2c_items_id == C2CItemDetail.c2c_items_id)
-        .where(C2CItemDetail.items_id == primary_items_sq)
+        select(func.count(func.distinct(current_details.c.c2c_items_id)))
+        .select_from(current_details)
+        .join(recent_item, recent_item.c2c_items_id == current_details.c.c2c_items_id)
+        .where(current_details.c.items_id == primary_items_sq)
         .where(recent_item.updated_at >= cutoff_value)
         .correlate(C2CItem)
         .scalar_subquery()
@@ -540,19 +597,20 @@ def _load_recent_15d_listings_page(
     offset = (page - 1) * limit
     cutoff = _utc_cutoff(days=15)
     items_id_sql = items_id_expr if hasattr(items_id_expr, "label") else literal(items_id_expr)
+    current_details = _current_item_details_subquery("recent_listing_current_details")
 
     matching_c2c_sq = (
-        select(C2CItemDetail.c2c_items_id)
-        .where(C2CItemDetail.items_id == items_id_sql)
+        select(current_details.c.c2c_items_id)
+        .where(current_details.c.items_id == items_id_sql)
         .correlate(None)
     )
     total_market_sq = (
         select(
-            C2CItemDetail.c2c_items_id.label("c2c_items_id"),
-            func.sum(C2CItemDetail.market_price).label("total_market"),
+            current_details.c.c2c_items_id.label("c2c_items_id"),
+            func.sum(current_details.c.market_price).label("total_market"),
         )
-        .where(C2CItemDetail.c2c_items_id.in_(matching_c2c_sq))
-        .group_by(C2CItemDetail.c2c_items_id)
+        .where(current_details.c.c2c_items_id.in_(matching_c2c_sq))
+        .group_by(current_details.c.c2c_items_id)
         .subquery()
     )
     denom = case((total_market_sq.c.total_market > 0, total_market_sq.c.total_market), else_=1)
@@ -571,11 +629,11 @@ def _load_recent_15d_listings_page(
             C2CItem.publish_status.label("publish_status"),
             C2CItem.sale_status.label("sale_status"),
             C2CItem.drop_reason.label("drop_reason"),
-            func.min(C2CItem.price * 1.0 * C2CItemDetail.market_price / denom).label("est_price"),
+            func.min(C2CItem.price * 1.0 * current_details.c.market_price / denom).label("est_price"),
         )
-        .join(C2CItemDetail, C2CItemDetail.c2c_items_id == C2CItem.c2c_items_id)
-        .join(total_market_sq, C2CItemDetail.c2c_items_id == total_market_sq.c.c2c_items_id)
-        .where(C2CItemDetail.items_id == items_id_sql)
+        .join(current_details, current_details.c.c2c_items_id == C2CItem.c2c_items_id)
+        .join(total_market_sq, current_details.c.c2c_items_id == total_market_sq.c.c2c_items_id)
+        .where(current_details.c.items_id == items_id_sql)
         .where(C2CItem.updated_at >= cutoff)
         .group_by(
             C2CItem.c2c_items_id,
@@ -680,6 +738,217 @@ def ping_database() -> None:
         session.scalar(select(1))
 
 
+def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
+    backend = _require_sqlalchemy_backend()
+    engine = backend._engine
+    inspector = sa.inspect(engine)
+    dialect = str(engine.dialect.name or "").lower()
+    backend_name = get_db_backend_name()
+    days = max(1, min(int(days or 7), 3650))
+    top_n = max(1, min(int(top_n or 20), 200))
+
+    tables = sorted(inspector.get_table_names())
+    utc_now = datetime.now(timezone.utc)
+    cutoff = (utc_now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated_at = utc_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    identifier_preparer = engine.dialect.identifier_preparer
+
+    sqlite_total_bytes: Optional[int] = None
+    sqlite_used_bytes: Optional[int] = None
+    sqlite_free_bytes: Optional[int] = None
+    sqlite_wal_bytes = 0
+    sqlite_dbstat_map: Dict[str, int] = {}
+    postgres_total_bytes: Optional[int] = None
+    skipped_tables: List[str] = []
+    warnings: List[str] = []
+
+    with engine.connect() as conn:
+        if dialect == "sqlite":
+            if backend.sqlite_path:
+                db_path = Path(backend.sqlite_path)
+                if db_path.exists():
+                    sqlite_total_bytes = int(db_path.stat().st_size)
+                wal_path = Path(f"{backend.sqlite_path}-wal")
+                if wal_path.exists():
+                    sqlite_wal_bytes = int(wal_path.stat().st_size)
+            try:
+                page_size = int(conn.execute(sa.text("PRAGMA page_size")).scalar() or 0)
+                page_count = int(conn.execute(sa.text("PRAGMA page_count")).scalar() or 0)
+                freelist_count = int(conn.execute(sa.text("PRAGMA freelist_count")).scalar() or 0)
+                if page_size > 0 and page_count >= 0 and freelist_count >= 0:
+                    sqlite_used_bytes = max(0, (page_count - freelist_count) * page_size)
+                    sqlite_free_bytes = max(0, freelist_count * page_size)
+            except Exception:
+                sqlite_used_bytes = None
+                sqlite_free_bytes = None
+            try:
+                rows = conn.execute(sa.text("SELECT name, SUM(pgsize) AS total_bytes FROM dbstat GROUP BY name")).all()
+                for row in rows:
+                    name = str(row[0] or "").strip()
+                    if not name:
+                        continue
+                    sqlite_dbstat_map[name] = int(row[1] or 0)
+            except Exception:
+                sqlite_dbstat_map = {}
+        elif dialect == "postgresql":
+            postgres_total_bytes = int(conn.execute(sa.text("SELECT pg_database_size(current_database())")).scalar() or 0)
+
+        table_rows: List[Dict[str, Any]] = []
+        for table_name in tables:
+            # Cloudflare D1 may expose internal tables (e.g. _cf_KV) that are not readable.
+            if backend_name == "cloudflare" and table_name.startswith("_cf_"):
+                skipped_tables.append(table_name)
+                continue
+            if table_name.startswith("sqlite_"):
+                skipped_tables.append(table_name)
+                continue
+
+            quoted_table = identifier_preparer.quote(table_name)
+            try:
+                row_count = int(conn.execute(sa.text(f"SELECT COUNT(*) FROM {quoted_table}")).scalar() or 0)
+                columns = {str(col.get("name") or "") for col in inspector.get_columns(table_name)}
+            except SQLAlchemyError as exc:
+                skipped_tables.append(table_name)
+                warnings.append(f"skip table {table_name}: {exc.__class__.__name__}")
+                continue
+            except Exception as exc:
+                skipped_tables.append(table_name)
+                warnings.append(f"skip table {table_name}: {exc.__class__.__name__}")
+                continue
+            recent_rows: Optional[int] = None
+            if table_name == "c2c_items_details":
+                try:
+                    if dialect == "sqlite":
+                        recent_rows = int(
+                            conn.execute(
+                                sa.text(
+                                    """
+                                    SELECT COUNT(*)
+                                    FROM c2c_items_details d
+                                    JOIN c2c_items i ON i.c2c_items_id = d.c2c_items_id
+                                    WHERE datetime(COALESCE(i.updated_at, i.created_at)) >= datetime(:cutoff)
+                                    """
+                                ),
+                                {"cutoff": cutoff},
+                            ).scalar()
+                            or 0
+                        )
+                    else:
+                        recent_rows = int(
+                            conn.execute(
+                                sa.text(
+                                    """
+                                    SELECT COUNT(*)
+                                    FROM c2c_items_details d
+                                    JOIN c2c_items i ON i.c2c_items_id = d.c2c_items_id
+                                    WHERE COALESCE(i.updated_at, i.created_at) >= :cutoff
+                                    """
+                                ),
+                                {"cutoff": cutoff},
+                            ).scalar()
+                            or 0
+                        )
+                except Exception:
+                    recent_rows = None
+            for ts_col in ("updated_at", "recorded_at", "created_at"):
+                if recent_rows is not None:
+                    break
+                if ts_col not in columns:
+                    continue
+                quoted_ts_col = identifier_preparer.quote(ts_col)
+                try:
+                    if dialect == "sqlite":
+                        recent_rows = int(
+                            conn.execute(
+                                sa.text(
+                                    f"SELECT COUNT(*) FROM {quoted_table} "
+                                    f"WHERE {quoted_ts_col} IS NOT NULL AND datetime({quoted_ts_col}) >= datetime(:cutoff)"
+                                ),
+                                {"cutoff": cutoff},
+                            ).scalar()
+                            or 0
+                        )
+                    else:
+                        recent_rows = int(
+                            conn.execute(
+                                sa.text(
+                                    f"SELECT COUNT(*) FROM {quoted_table} "
+                                    f"WHERE {quoted_ts_col} IS NOT NULL AND {quoted_ts_col} >= :cutoff"
+                                ),
+                                {"cutoff": cutoff},
+                            ).scalar()
+                            or 0
+                        )
+                except Exception:
+                    recent_rows = None
+                break
+
+            table_bytes: Optional[int] = None
+            index_bytes: Optional[int] = None
+            total_relation_bytes: Optional[int] = None
+            if dialect == "sqlite":
+                if sqlite_dbstat_map:
+                    try:
+                        index_names = [str(idx.get("name") or "").strip() for idx in inspector.get_indexes(table_name)]
+                    except Exception:
+                        index_names = []
+                    table_bytes = int(sqlite_dbstat_map.get(table_name, 0))
+                    index_bytes = sum(int(sqlite_dbstat_map.get(index_name, 0)) for index_name in index_names if index_name)
+                    total_relation_bytes = table_bytes + index_bytes
+            elif dialect == "postgresql":
+                schema = str(inspector.default_schema_name or "public")
+                relation_name = f"{schema}.{table_name}"
+                table_bytes = int(
+                    conn.execute(sa.text("SELECT COALESCE(pg_table_size(to_regclass(:rel)), 0)"), {"rel": relation_name}).scalar() or 0
+                )
+                index_bytes = int(
+                    conn.execute(sa.text("SELECT COALESCE(pg_indexes_size(to_regclass(:rel)), 0)"), {"rel": relation_name}).scalar() or 0
+                )
+                total_relation_bytes = table_bytes + index_bytes
+
+            table_rows.append(
+                {
+                    "name": table_name,
+                    "row_count": row_count,
+                    "recent_rows": recent_rows,
+                    "table_bytes": table_bytes,
+                    "index_bytes": index_bytes,
+                    "total_bytes": total_relation_bytes,
+                }
+            )
+
+    table_rows.sort(
+        key=lambda item: (
+            int(item.get("total_bytes") or 0),
+            int(item.get("row_count") or 0),
+            str(item.get("name") or ""),
+        ),
+        reverse=True,
+    )
+    top_tables = table_rows[:top_n]
+    total_relation_bytes = sum(int(item.get("total_bytes") or 0) for item in table_rows)
+    total_rows = sum(int(item.get("row_count") or 0) for item in table_rows)
+    recent_total_rows = sum(int(item.get("recent_rows") or 0) for item in table_rows if item.get("recent_rows") is not None)
+
+    return {
+        "generated_at": generated_at,
+        "backend": get_db_backend_name(),
+        "dialect": dialect,
+        "days_window": days,
+        "table_count": len(table_rows),
+        "total_rows": total_rows,
+        "recent_total_rows": recent_total_rows,
+        "total_db_bytes": sqlite_total_bytes if dialect == "sqlite" else postgres_total_bytes,
+        "used_db_bytes": sqlite_used_bytes if dialect == "sqlite" else None,
+        "free_db_bytes": sqlite_free_bytes if dialect == "sqlite" else None,
+        "wal_bytes": sqlite_wal_bytes if dialect == "sqlite" else None,
+        "tables_total_bytes": total_relation_bytes,
+        "skipped_tables": skipped_tables,
+        "warnings": warnings,
+        "tables": top_tables,
+    }
+
+
 def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
     backend = _require_sqlalchemy_backend()
     ids = [int(it["c2cItemsId"]) for it in items if it.get("c2cItemsId") is not None]
@@ -694,18 +963,7 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
             ).all()
             existing_rows = {int(row.c2c_items_id): row for row in rows}
 
-        detail_item_ids = [
-            int(it["c2cItemsId"])
-            for it in items
-            if it.get("c2cItemsId") is not None and "detailDtoList" in it
-        ]
-        if detail_item_ids:
-            session.execute(
-                delete(C2CItemDetail).where(C2CItemDetail.c2c_items_id.in_(detail_item_ids))
-            )
-
         detail_models: List[C2CItemDetail] = []
-        price_history_models: List[C2CPriceHistory] = []
 
         for it in items:
             item_id = it.get("c2cItemsId")
@@ -717,7 +975,6 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                 timestamp = _now()
                 row = existing_rows.get(item_id)
                 is_new = row is None
-                old_price = row.price if row is not None else None
                 if row is None:
                     row = C2CItem(c2c_items_id=item_id)
                     session.add(row)
@@ -749,6 +1006,7 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                 if is_new:
                     row.created_at = timestamp
 
+                details_snapshot_at = _snapshot_now()
                 for d_item in it.get("detailDtoList", []):
                     d_items_id = d_item.get("itemsId")
                     if not d_items_id:
@@ -760,28 +1018,18 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                             name=d_item.get("name", ""),
                             img_url=_extract_img_from_detail_json(json.dumps([d_item])),
                             market_price=d_item.get("marketPrice", 0),
+                            snapshot_at=details_snapshot_at,
                         )
                     )
 
                 saved += 1
                 if is_new:
                     inserted += 1
-                if is_new or old_price != new_price:
-                    price_history_models.append(
-                        C2CPriceHistory(
-                            c2c_items_id=item_id,
-                            price=new_price,
-                            show_price=it.get("showPrice"),
-                            recorded_at=timestamp,
-                        )
-                    )
             except Exception:
                 continue
 
         if detail_models:
             session.add_all(detail_models)
-        if price_history_models:
-            session.add_all(price_history_models)
 
     return saved, inserted
 
@@ -991,14 +1239,15 @@ def get_15d_listing_counts_batch(c2c_items_ids: List[int]) -> Dict[int, int]:
     
     backend = _require_sqlalchemy_backend()
     cutoff = _utc_cutoff(days=15)
+    current_details = _current_item_details_subquery("counts_current_details")
     with backend.session() as session:
         rows_items = session.execute(
             select(
-                C2CItemDetail.c2c_items_id,
-                func.min(C2CItemDetail.items_id),
+                current_details.c.c2c_items_id,
+                func.min(current_details.c.items_id),
             )
-            .where(C2CItemDetail.c2c_items_id.in_(c2c_items_ids))
-            .group_by(C2CItemDetail.c2c_items_id)
+            .where(current_details.c.c2c_items_id.in_(c2c_items_ids))
+            .group_by(current_details.c.c2c_items_id)
         ).all()
 
         primary_items_map: Dict[int, int] = {}
@@ -1014,13 +1263,13 @@ def get_15d_listing_counts_batch(c2c_items_ids: List[int]) -> Dict[int, int]:
 
         rows_counts = session.execute(
             select(
-                C2CItemDetail.items_id,
-                func.count(func.distinct(C2CItemDetail.c2c_items_id)),
+                current_details.c.items_id,
+                func.count(func.distinct(current_details.c.c2c_items_id)),
             )
-            .join(C2CItem, C2CItemDetail.c2c_items_id == C2CItem.c2c_items_id)
-            .where(C2CItemDetail.items_id.in_(items_ids_to_query))
+            .join(C2CItem, current_details.c.c2c_items_id == C2CItem.c2c_items_id)
+            .where(current_details.c.items_id.in_(items_ids_to_query))
             .where(C2CItem.updated_at >= cutoff)
-            .group_by(C2CItemDetail.items_id)
+            .group_by(current_details.c.items_id)
         ).all()
 
     counts_map = {int(items_id): int(count) for items_id, count in rows_counts}
@@ -1031,133 +1280,76 @@ def get_15d_listing_counts_batch(c2c_items_ids: List[int]) -> Dict[int, int]:
 
 
 def get_item_price_history(c2c_items_id: int) -> List[Dict[str, Any]]:
-    """Return price history for a single item, ordered by recorded_at ASC."""
+    """Return item price points derived from detail snapshots, ordered by snapshot_at ASC."""
     backend = _require_sqlalchemy_backend()
-    with backend.session() as session:
-        rows = session.scalars(
-            select(C2CPriceHistory)
-            .where(C2CPriceHistory.c2c_items_id == c2c_items_id)
-            .order_by(C2CPriceHistory.recorded_at.asc())
-        ).all()
-    return [
-        {
-            "recorded_at": row.recorded_at,
-            "price": row.price,
-            "show_price": row.show_price,
-        }
-        for row in rows
-    ]
-
-
-def get_market_item_price_history(c2c_items_id: int) -> Tuple[Optional[int], List[Dict[str, Any]]]:
-    """Return item price history using a single DB query.
-
-    If the market item maps to a primary items_id, return product-level aggregated
-    history for the last 15 days. Otherwise, fall back to the item's own raw history.
-    """
-    backend = _require_sqlalchemy_backend()
-    cutoff = _utc_cutoff(days=15)
-    items_meta = (
-        select(
-            select(C2CItemDetail.items_id)
-            .where(C2CItemDetail.c2c_items_id == c2c_items_id)
-            .order_by(C2CItemDetail.id.asc())
-            .limit(1)
-            .scalar_subquery()
-            .label("items_id")
-        ).cte("item_price_history_meta")
-    )
-    total_market_sq = (
-        select(
-            C2CItemDetail.c2c_items_id.label("c2c_items_id"),
-            func.sum(C2CItemDetail.market_price).label("total_market"),
-        )
-        .group_by(C2CItemDetail.c2c_items_id)
-        .subquery()
-    )
-    denom = case((total_market_sq.c.total_market > 0, total_market_sq.c.total_market), else_=1)
-
-    product_rows = (
-        select(
-            C2CPriceHistory.recorded_at.label("recorded_at"),
-            (C2CPriceHistory.price * 1.0 * C2CItemDetail.market_price / denom).label("price"),
-            literal(None).label("show_price"),
-            C2CItem.c2c_items_name.label("name"),
-            C2CItem.c2c_items_id.label("history_c2c_items_id"),
-        )
-        .select_from(items_meta)
-        .join(C2CItemDetail, C2CItemDetail.items_id == items_meta.c.items_id)
-        .join(C2CPriceHistory, C2CPriceHistory.c2c_items_id == C2CItemDetail.c2c_items_id)
-        .join(C2CItem, C2CItem.c2c_items_id == C2CPriceHistory.c2c_items_id)
-        .join(total_market_sq, C2CItemDetail.c2c_items_id == total_market_sq.c.c2c_items_id)
-        .where(items_meta.c.items_id.is_not(None))
-        .where(C2CPriceHistory.recorded_at >= cutoff)
-    )
-    direct_rows = (
-        select(
-            C2CPriceHistory.recorded_at.label("recorded_at"),
-            C2CPriceHistory.price.label("price"),
-            C2CPriceHistory.show_price.label("show_price"),
-            literal(None).label("name"),
-            literal(None).label("history_c2c_items_id"),
-        )
-        .select_from(items_meta)
-        .join(C2CPriceHistory, true())
-        .where(items_meta.c.items_id.is_(None))
-        .where(C2CPriceHistory.c2c_items_id == c2c_items_id)
-    )
-    history_rows = union_all(product_rows, direct_rows).subquery()
-
     with backend.session() as session:
         rows = session.execute(
             select(
-                items_meta.c.items_id,
-                history_rows.c.recorded_at,
-                history_rows.c.price,
-                history_rows.c.show_price,
-                history_rows.c.name,
-                history_rows.c.history_c2c_items_id,
+                C2CItemDetail.snapshot_at.label("recorded_at"),
+                C2CItem.price.label("price"),
+                C2CItem.show_price.label("show_price"),
             )
-            .select_from(items_meta)
-            .outerjoin(history_rows, true())
-            .order_by(history_rows.c.recorded_at.asc())
+            .join(C2CItem, C2CItem.c2c_items_id == C2CItemDetail.c2c_items_id)
+            .where(C2CItemDetail.c2c_items_id == c2c_items_id)
+            .where(C2CItemDetail.snapshot_at.is_not(None))
+            .group_by(
+                C2CItemDetail.snapshot_at,
+                C2CItem.price,
+                C2CItem.show_price,
+            )
+            .order_by(C2CItemDetail.snapshot_at.asc())
         ).all()
-
-    items_id = int(rows[0].items_id) if rows and rows[0].items_id is not None else None
+    if not rows:
+        with backend.session() as session:
+            row = session.execute(
+                select(
+                    func.coalesce(C2CItem.created_at, C2CItem.updated_at).label("recorded_at"),
+                    C2CItem.price.label("price"),
+                    C2CItem.show_price.label("show_price"),
+                ).where(C2CItem.c2c_items_id == c2c_items_id)
+            ).first()
+        if row is None or row.recorded_at is None:
+            return []
+        price_value = int(row.price) if row.price is not None else 0
+        return [
+            {
+                "recorded_at": row.recorded_at,
+                "price": price_value,
+                "show_price": row.show_price or f"{price_value / 100:.2f}",
+            }
+        ]
     history: List[Dict[str, Any]] = []
     for row in rows:
         if row.recorded_at is None:
             continue
         price_value = int(row.price) if row.price is not None else 0
-        if items_id is None:
-            history.append(
-                {
-                    "recorded_at": row.recorded_at,
-                    "price": price_value,
-                    "show_price": row.show_price or f"{price_value / 100:.2f}",
-                }
-            )
-            continue
         history.append(
             {
                 "recorded_at": row.recorded_at,
                 "price": price_value,
-                "show_price": f"{price_value / 100:.2f}",
-                "name": row.name,
-                "c2c_items_id": row.history_c2c_items_id,
+                "show_price": row.show_price or f"{price_value / 100:.2f}",
             }
         )
-    return items_id, history
+    return history
+
+
+def get_market_item_price_history(c2c_items_id: int) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+    """Return item history using detail snapshots; aggregate at product level if mapped."""
+    items_id = get_primary_items_id(c2c_items_id)
+    if items_id is None:
+        return None, get_item_price_history(c2c_items_id)
+    return items_id, get_product_price_history(items_id)
 
 
 def get_primary_items_id(c2c_items_id: int) -> Optional[int]:
     """Get the first official itemsId associated with a c2c_items_id."""
     backend = _require_sqlalchemy_backend()
+    current_details = _current_item_details_subquery("primary_items_current_details")
     with backend.session() as session:
         item_id = session.scalar(
-            select(C2CItemDetail.items_id)
-            .where(C2CItemDetail.c2c_items_id == c2c_items_id)
-            .order_by(C2CItemDetail.id.asc())
+            select(current_details.c.items_id)
+            .where(current_details.c.c2c_items_id == c2c_items_id)
+            .order_by(current_details.c.id.asc())
             .limit(1)
         )
         return int(item_id) if item_id is not None else None
@@ -1167,38 +1359,39 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
     """Get aggregated metadata for a specific official itemsId (Product)."""
     backend = _require_sqlalchemy_backend()
     cutoff = _utc_cutoff(days=15)
+    current_details = _current_item_details_subquery("product_metadata_current_details")
     
     total_market_sq = (
         select(
-            C2CItemDetail.c2c_items_id.label("c2c_items_id"),
-            func.sum(C2CItemDetail.market_price).label("total_market"),
+            current_details.c.c2c_items_id.label("c2c_items_id"),
+            func.sum(current_details.c.market_price).label("total_market"),
         )
-        .group_by(C2CItemDetail.c2c_items_id)
+        .group_by(current_details.c.c2c_items_id)
         .subquery()
     )
     denom = case((total_market_sq.c.total_market > 0, total_market_sq.c.total_market), else_=1)
     
     name_sq = (
-        select(C2CItemDetail.name)
-        .where(C2CItemDetail.items_id == items_id)
+        select(current_details.c.name)
+        .where(current_details.c.items_id == items_id)
         .limit(1)
         .scalar_subquery()
     )
     img_url_sq = (
-        select(C2CItemDetail.img_url)
-        .where(C2CItemDetail.items_id == items_id)
+        select(current_details.c.img_url)
+        .where(current_details.c.items_id == items_id)
         .limit(1)
         .scalar_subquery()
     )
     stats_sq = (
         select(
-            func.min(C2CItem.price * 1.0 * C2CItemDetail.market_price / denom).label("price_min"),
-            func.max(C2CItem.price * 1.0 * C2CItemDetail.market_price / denom).label("price_max"),
+            func.min(C2CItem.price * 1.0 * current_details.c.market_price / denom).label("price_min"),
+            func.max(C2CItem.price * 1.0 * current_details.c.market_price / denom).label("price_max"),
             func.count(func.distinct(C2CItem.c2c_items_id)).label("recent_listed_count"),
         )
-        .join(C2CItemDetail, C2CItem.c2c_items_id == C2CItemDetail.c2c_items_id)
+        .join(current_details, C2CItem.c2c_items_id == current_details.c.c2c_items_id)
         .join(total_market_sq, C2CItem.c2c_items_id == total_market_sq.c.c2c_items_id)
-        .where(C2CItemDetail.items_id == items_id)
+        .where(current_details.c.items_id == items_id)
         .where(C2CItem.updated_at >= cutoff)
         .subquery()
     )
@@ -1234,32 +1427,44 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
 
 
 def get_product_price_history(items_id: int) -> List[Dict[str, Any]]:
-    """Return point-in-time price history for a specific official itemsId (scatter plot data) in the last 15 days."""
+    """Return product-level history from detail snapshots in the last 15 days."""
     backend = _require_sqlalchemy_backend()
     cutoff = _utc_cutoff(days=15)
     total_market_sq = (
         select(
             C2CItemDetail.c2c_items_id.label("c2c_items_id"),
+            C2CItemDetail.snapshot_at.label("snapshot_at"),
             func.sum(C2CItemDetail.market_price).label("total_market"),
         )
-        .group_by(C2CItemDetail.c2c_items_id)
+        .where(C2CItemDetail.snapshot_at.is_not(None))
+        .group_by(C2CItemDetail.c2c_items_id, C2CItemDetail.snapshot_at)
         .subquery()
     )
     denom = case((total_market_sq.c.total_market > 0, total_market_sq.c.total_market), else_=1)
     with backend.session() as session:
         rows = session.execute(
             select(
-                C2CPriceHistory.recorded_at,
-                (C2CPriceHistory.price * 1.0 * C2CItemDetail.market_price / denom).label("est_price"),
+                C2CItemDetail.snapshot_at.label("recorded_at"),
+                func.min(C2CItem.price * 1.0 * C2CItemDetail.market_price / denom).label("est_price"),
                 C2CItem.c2c_items_name,
                 C2CItem.c2c_items_id,
             )
-            .join(C2CItemDetail, C2CPriceHistory.c2c_items_id == C2CItemDetail.c2c_items_id)
-            .join(C2CItem, C2CPriceHistory.c2c_items_id == C2CItem.c2c_items_id)
-            .join(total_market_sq, C2CItemDetail.c2c_items_id == total_market_sq.c.c2c_items_id)
+            .join(C2CItem, C2CItem.c2c_items_id == C2CItemDetail.c2c_items_id)
+            .join(
+                total_market_sq,
+                and_(
+                    C2CItemDetail.c2c_items_id == total_market_sq.c.c2c_items_id,
+                    C2CItemDetail.snapshot_at == total_market_sq.c.snapshot_at,
+                ),
+            )
             .where(C2CItemDetail.items_id == items_id)
-            .where(C2CPriceHistory.recorded_at >= cutoff)
-            .order_by(C2CPriceHistory.recorded_at.asc())
+            .where(C2CItemDetail.snapshot_at >= cutoff)
+            .group_by(
+                C2CItemDetail.snapshot_at,
+                C2CItem.c2c_items_name,
+                C2CItem.c2c_items_id,
+            )
+            .order_by(C2CItemDetail.snapshot_at.asc())
         ).all()
     history = []
     for row in rows:
@@ -1290,10 +1495,11 @@ def get_market_item_recent_15d_listings(
     limit: int = 20,
     sort_by: str = "TIME_DESC",
 ) -> Tuple[Optional[int], List[Dict[str, Any]], int, int]:
+    current_details = _current_item_details_subquery("market_item_recent_current_details")
     items_id_sq = (
-        select(C2CItemDetail.items_id)
-        .where(C2CItemDetail.c2c_items_id == c2c_items_id)
-        .order_by(C2CItemDetail.id.asc())
+        select(current_details.c.items_id)
+        .where(current_details.c.c2c_items_id == c2c_items_id)
+        .order_by(current_details.c.id.asc())
         .limit(1)
         .scalar_subquery()
     )
@@ -1327,11 +1533,12 @@ def get_15d_listing_count(items_id: int) -> int:
     if not items_id:
         return 0
     backend = _require_sqlalchemy_backend()
+    current_details = _current_item_details_subquery("single_count_current_details")
     with backend.session() as session:
         total = session.scalar(
-            select(func.count(func.distinct(C2CItemDetail.c2c_items_id)))
-            .join(C2CItem, C2CItemDetail.c2c_items_id == C2CItem.c2c_items_id)
-            .where(C2CItemDetail.items_id == items_id)
+            select(func.count(func.distinct(current_details.c.c2c_items_id)))
+            .join(C2CItem, current_details.c.c2c_items_id == C2CItem.c2c_items_id)
+            .where(current_details.c.items_id == items_id)
             .where(C2CItem.updated_at >= _utc_cutoff(days=15))
         )
         return int(total or 0)

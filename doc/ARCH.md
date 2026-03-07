@@ -96,6 +96,7 @@ BiliMartMonitor/
 | GET | /api/admin/qr/create | generate QR login code |
 | POST | /api/admin/qr/poll | poll QR login result |
 | GET | /api/settings/db-ping | test database connection latency |
+| GET | /api/settings/db-size | database size diagnostics (table rows/bytes, recent growth) |
 | GET | /api/settings/logs | read recent in-memory scan logs |
 | GET | /api/settings/user-notifications | read one user's notification config |
 | PUT | /api/settings/user-notifications | update one user's notification config |

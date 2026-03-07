@@ -910,6 +910,10 @@ input {
   background: rgba(255, 255, 255, 0.02);
 }
 
+.bsm-db-size-table-wrap .bsm-table {
+  min-width: 760px;
+}
+
 /* ============================================================
    Text Utilities
    ============================================================ */
@@ -1708,9 +1712,25 @@ input {
 
 .bsm-log-level {
   flex-shrink: 0;
-  width: 40px;
+  width: 44px;
   font-weight: 600;
   white-space: nowrap;
+}
+
+.bsm-log-stage {
+  flex-shrink: 0;
+  width: 54px;
+  font-weight: 700;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.bsm-log-stage-wait .bsm-log-stage {
+  color: #93c5fd;
+}
+
+.bsm-log-stage-exec .bsm-log-stage {
+  color: #6ee7b7;
 }
 
 .bsm-log-msg {
@@ -1928,6 +1948,11 @@ input {
   min-width: 0;
 }
 
+.bsm-detail-full-width-chart {
+  width: 100%;
+  min-width: 0;
+}
+
 @media (min-width: 1024px) {
   .bsm-detail-layout {
     display: grid;
@@ -1949,6 +1974,10 @@ input {
     grid-column: 1;
     grid-row: 2;
     min-width: 0;
+  }
+
+  .bsm-detail-full-width-chart {
+    grid-column: 1 / -1;
   }
 }
 /* Refresh in-flight animation */

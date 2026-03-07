@@ -297,6 +297,25 @@ def api_ping_db(_: Dict[str, Any] = Depends(get_current_admin)) -> JSONResponse:
         return JSONResponse({"latency_ms": None, "error": str(e)})
 
 
+@router.get("/api/settings/db-size")
+def api_db_size_diagnostics(
+    days: int = 7,
+    top_n: int = 20,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    from bsm.db import get_database_size_report
+
+    if days < 1 or days > 3650:
+        return JSONResponse({"error": "days must be between 1 and 3650"}, status_code=422)
+    if top_n < 1 or top_n > 200:
+        return JSONResponse({"error": "top_n must be between 1 and 200"}, status_code=422)
+    try:
+        report = get_database_size_report(days=days, top_n=top_n)
+        return JSONResponse(report)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @router.put("/api/settings")
 async def api_update_settings(body: SettingsUpdate, _: Dict[str, Any] = Depends(get_current_admin)) -> JSONResponse:
     from bsm.settings import reset_public_account_settings_cache, save_yaml_config_value

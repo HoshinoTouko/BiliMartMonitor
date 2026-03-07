@@ -17,7 +17,7 @@ if SRC_ROOT not in sys.path:
 
 from bsm import db
 from bsm import settings
-from bsm.orm_models import C2CItem
+from bsm.orm_models import C2CItem, C2CItemDetail
 
 
 class DatabaseTestCase(unittest.TestCase):
@@ -241,6 +241,49 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertIn(10000, prices)
         self.assertIn(15000, prices)
 
+    def test_item_details_incremental_snapshots_use_latest_for_queries(self) -> None:
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 4101,
+                    "c2cItemsName": "Snapshot Item",
+                    "price": 10000,
+                    "showPrice": "100.00",
+                    "detailDtoList": [
+                        {"itemsId": 61, "name": "Product B", "marketPrice": 100},
+                        {"itemsId": 62, "name": "Product C", "marketPrice": 900},
+                    ],
+                }
+            ]
+        )
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 4101,
+                    "c2cItemsName": "Snapshot Item",
+                    "price": 10000,
+                    "showPrice": "100.00",
+                    "detailDtoList": [
+                        {"itemsId": 61, "name": "Product B", "marketPrice": 100},
+                    ],
+                }
+            ]
+        )
+
+        backend = db._require_sqlalchemy_backend()
+        with backend.session() as session:
+            detail_rows = session.query(C2CItemDetail).filter(C2CItemDetail.c2c_items_id == 4101).all()
+        self.assertEqual(len(detail_rows), 3, "Snapshot writes should be append-only")
+
+        listings, _, _ = db.get_recent_15d_listings(61, page=1, limit=10, sort_by="TIME_DESC")
+        self.assertEqual(len(listings), 1)
+        self.assertEqual(listings[0]["c2c_items_id"], 4101)
+        self.assertEqual(
+            listings[0]["show_est_price"],
+            "100.00",
+            "Estimations must use latest snapshot details only",
+        )
+
     def test_database_backend_uses_sqlalchemy_for_sqlite(self) -> None:
         settings = db._load_db_settings()
         backend = db._backend()
@@ -417,6 +460,53 @@ class DatabaseTestCase(unittest.TestCase):
         refreshed = settings.get_public_account_settings()
         self.assertEqual(refreshed["interval"], 45)
 
+    def test_database_size_report_counts_recent_rows_for_c2c_item_details(self) -> None:
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 9101,
+                    "c2cItemsName": "Recent bundle",
+                    "price": 10000,
+                    "showPrice": "100.00",
+                    "detailDtoList": [
+                        {"itemsId": 1, "name": "A", "marketPrice": 100},
+                        {"itemsId": 2, "name": "B", "marketPrice": 200},
+                    ],
+                },
+                {
+                    "c2cItemsId": 9102,
+                    "c2cItemsName": "Old bundle",
+                    "price": 12000,
+                    "showPrice": "120.00",
+                    "detailDtoList": [
+                        {"itemsId": 3, "name": "C", "marketPrice": 300},
+                        {"itemsId": 4, "name": "D", "marketPrice": 400},
+                        {"itemsId": 5, "name": "E", "marketPrice": 500},
+                    ],
+                },
+            ]
+        )
+
+        backend = db._require_sqlalchemy_backend()
+        with backend.session() as session:
+            session.execute(
+                update(C2CItem)
+                .where(C2CItem.c2c_items_id == 9101)
+                .values(updated_at="2026-03-06T00:00:00Z", created_at="2026-03-06T00:00:00Z")
+            )
+            session.execute(
+                update(C2CItem)
+                .where(C2CItem.c2c_items_id == 9102)
+                .values(updated_at="2025-01-01T00:00:00Z", created_at="2025-01-01T00:00:00Z")
+            )
+            session.commit()
+
+        report = db.get_database_size_report(days=7, top_n=50)
+        details_row = next((row for row in report["tables"] if row.get("name") == "c2c_items_details"), None)
+        self.assertIsNotNone(details_row)
+        self.assertEqual(int(details_row["row_count"]), 5)
+        self.assertEqual(int(details_row["recent_rows"]), 2)
+
 
 class AlembicMigrationTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -547,6 +637,101 @@ class AlembicMigrationTestCase(unittest.TestCase):
                 "SELECT telegram_ids_json FROM access_users WHERE username = 'admin'"
             ).fetchone()
             self.assertEqual(telegram_ids_json[0], "[\"123456\"]")
+        finally:
+            conn.close()
+
+    def test_alembic_upgrade_backfills_detail_snapshots_from_price_history(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE c2c_items (
+                    c2c_items_id INTEGER PRIMARY KEY,
+                    updated_at TEXT,
+                    created_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE c2c_items_details (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    c2c_items_id INTEGER NOT NULL,
+                    items_id INTEGER NOT NULL,
+                    name TEXT,
+                    img_url TEXT,
+                    market_price INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE c2c_price_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    c2c_items_id INTEGER NOT NULL,
+                    price INTEGER,
+                    show_price TEXT,
+                    recorded_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO c2c_items (c2c_items_id, updated_at, created_at)
+                VALUES (9001, '2026-03-05T00:00:00Z', '2026-03-05T00:00:00Z')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO c2c_items_details (c2c_items_id, items_id, name, img_url, market_price)
+                VALUES (9001, 501, 'Legacy Detail', 'https://example.com/a.png', 100)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO c2c_price_history (c2c_items_id, price, show_price, recorded_at)
+                VALUES
+                    (9001, 10000, '100.00', '2026-03-01T00:00:00Z'),
+                    (9001, 9800, '98.00', '2026-03-02T00:00:00Z')
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        os.environ["BSM_DB_BACKEND"] = "sqlite"
+        os.environ["BSM_SQLITE_PATH"] = self.db_path
+
+        with open(self.env_path, "w", encoding="utf-8") as f:
+            f.write("BSM_DB_BACKEND=sqlite\n")
+            f.write(f"BSM_SQLITE_PATH={self.db_path}\n")
+
+        cfg = Config(os.path.join(PROJECT_ROOT, "alembic.ini"))
+        command.upgrade(cfg, "head")
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            detail_columns = {row[1] for row in conn.execute("PRAGMA table_info(c2c_items_details)").fetchall()}
+            self.assertIn("snapshot_at", detail_columns)
+
+            snapshot_rows = conn.execute(
+                """
+                SELECT snapshot_at, items_id, name, img_url, market_price
+                FROM c2c_items_details
+                WHERE c2c_items_id = 9001
+                ORDER BY snapshot_at ASC
+                """
+            ).fetchall()
+            self.assertEqual(len(snapshot_rows), 3)
+            snapshot_times = {row[0] for row in snapshot_rows}
+            self.assertIn("2026-03-01T00:00:00Z", snapshot_times)
+            self.assertIn("2026-03-02T00:00:00Z", snapshot_times)
+            self.assertIn("2026-03-05T00:00:00Z", snapshot_times)
+            for row in snapshot_rows:
+                self.assertEqual(row[1], 501)
+                self.assertEqual(row[2], "Legacy Detail")
+                self.assertEqual(row[3], "https://example.com/a.png")
+                self.assertEqual(row[4], 100)
         finally:
             conn.close()
 

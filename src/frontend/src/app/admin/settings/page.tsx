@@ -39,11 +39,48 @@ interface LogLine {
     msg: string;
 }
 
+interface DbSizeTableRow {
+    name: string;
+    row_count: number;
+    recent_rows: number | null;
+    table_bytes: number | null;
+    index_bytes: number | null;
+    total_bytes: number | null;
+}
+
+interface DbSizeReport {
+    generated_at: string;
+    backend: string;
+    dialect: string;
+    days_window: number;
+    table_count: number;
+    total_rows: number;
+    recent_total_rows: number;
+    total_db_bytes: number | null;
+    used_db_bytes: number | null;
+    free_db_bytes: number | null;
+    wal_bytes: number | null;
+    tables_total_bytes: number;
+    tables: DbSizeTableRow[];
+}
+
+type LogStage = "WAIT" | "EXEC" | null;
+
 const LEVEL_COLORS: Record<string, string> = {
     INFO: "var(--text-secondary)",
     WARN: "#fbbf24",
     ERROR: "#f87171",
 };
+
+function parseLogStage(msg: string): { stage: LogStage; text: string } {
+    if (msg.startsWith("[WAIT]")) {
+        return { stage: "WAIT", text: msg.replace(/^\[WAIT\]\s*/, "") };
+    }
+    if (msg.startsWith("[EXEC]")) {
+        return { stage: "EXEC", text: msg.replace(/^\[EXEC\]\s*/, "") };
+    }
+    return { stage: null, text: msg };
+}
 
 function timeAgo(iso: string): string {
     const diff = Math.floor((Date.now() - new Date(iso.replace(" ", "T")).getTime()) / 1000);
@@ -51,6 +88,19 @@ function timeAgo(iso: string): string {
     if (diff < 60) return `${diff} 秒前`;
     if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
     return `${Math.floor(diff / 3600)} 小时前`;
+}
+
+function formatBytes(bytes: number | null | undefined): string {
+    if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "—";
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ["KB", "MB", "GB", "TB"];
+    let value = bytes / 1024;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex += 1;
+    }
+    return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
 export default function SystemSettingsPage() {
@@ -69,6 +119,9 @@ export default function SystemSettingsPage() {
     const [dbPing, setDbPing] = useState<number | null>(null);
     const [dbPingError, setDbPingError] = useState<string | null>(null);
     const [pinging, setPinging] = useState(false);
+    const [dbSize, setDbSize] = useState<DbSizeReport | null>(null);
+    const [dbSizeError, setDbSizeError] = useState<string | null>(null);
+    const [loadingDbSize, setLoadingDbSize] = useState(false);
 
     // Editable fields
     const [scanMode, setScanMode] = useState("latest");
@@ -131,6 +184,20 @@ export default function SystemSettingsPage() {
             setDbPing(null);
         } finally {
             setPinging(false);
+        }
+    }, []);
+
+    const handleLoadDbSize = useCallback(async () => {
+        setLoadingDbSize(true);
+        setDbSizeError(null);
+        try {
+            const data = await apiGet<DbSizeReport>("/api/settings/db-size?days=7&top_n=12");
+            setDbSize(data);
+        } catch (e) {
+            setDbSizeError(e instanceof Error ? e.message : "加载数据库体积诊断失败");
+            setDbSize(null);
+        } finally {
+            setLoadingDbSize(false);
         }
     }, []);
 
@@ -725,18 +792,23 @@ export default function SystemSettingsPage() {
                     {logs.length === 0 ? (
                         <div className="bsm-log-empty">暂无日志。等待扫描任务启动…</div>
                     ) : (
-                        logs.map((line, i) => (
-                            <div key={i} className="bsm-log-line">
-                                <span className="bsm-log-ts">{line.ts}</span>
-                                <span
-                                    className="bsm-log-level"
-                                    style={{ color: LEVEL_COLORS[line.level] ?? "var(--text-secondary)" }}
-                                >
-                                    {line.level}
-                                </span>
-                                <span className="bsm-log-msg">{line.msg}</span>
-                            </div>
-                        ))
+                        logs.map((line, i) => {
+                            const parsed = parseLogStage(line.msg);
+                            const stageClass = parsed.stage ? `bsm-log-stage-${parsed.stage.toLowerCase()}` : "";
+                            return (
+                                <div key={i} className={`bsm-log-line ${stageClass}`}>
+                                    <span className="bsm-log-ts">{line.ts}</span>
+                                    <span
+                                        className="bsm-log-level"
+                                        style={{ color: LEVEL_COLORS[line.level] ?? "var(--text-secondary)" }}
+                                    >
+                                        {line.level}
+                                    </span>
+                                    <span className="bsm-log-stage">{parsed.stage ? `[${parsed.stage}]` : "[SYS]"}</span>
+                                    <span className="bsm-log-msg">{parsed.text}</span>
+                                </div>
+                            );
+                        })
                     )}
                 </div>
                 <div style={{ display: "flex", justifyContent: "flex-start", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.75rem" }}>
@@ -757,6 +829,86 @@ export default function SystemSettingsPage() {
                         {restartingCron ? "重启中…" : "重启 Cron"}
                     </button>
                 </div>
+            </div>
+
+            <div className="bsm-section">
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.75rem", gap: "0.75rem", flexWrap: "wrap" }}>
+                    <div className="bsm-section-title" style={{ margin: 0 }}>数据库体积诊断</div>
+                    <button
+                        type="button"
+                        className="bsm-btn bsm-btn-outline"
+                        style={{ padding: "0.35rem 0.65rem", fontSize: "0.85rem", height: "auto" }}
+                        onClick={handleLoadDbSize}
+                        disabled={loadingDbSize}
+                    >
+                        {loadingDbSize ? "诊断中…" : (dbSize ? "重新诊断" : "开始诊断")}
+                    </button>
+                </div>
+                {dbSizeError ? (
+                    <div className="bsm-alert bsm-alert-error" style={{ marginBottom: 0 }}>
+                        {dbSizeError}
+                    </div>
+                ) : dbSize ? (
+                    <>
+                        <div className="bsm-settings-cron-grid" style={{ marginBottom: "0.75rem" }}>
+                            <div className="bsm-stat-card">
+                                <span className="bsm-stat-label">数据库总大小</span>
+                                <span className="bsm-stat-value" style={{ fontSize: "1rem" }}>{formatBytes(dbSize.total_db_bytes)}</span>
+                            </div>
+                            <div className="bsm-stat-card">
+                                <span className="bsm-stat-label">表+索引合计</span>
+                                <span className="bsm-stat-value" style={{ fontSize: "1rem" }}>{formatBytes(dbSize.tables_total_bytes)}</span>
+                            </div>
+                            <div className="bsm-stat-card">
+                                <span className="bsm-stat-label">可回收空间</span>
+                                <span className="bsm-stat-value" style={{ fontSize: "1rem" }}>{formatBytes(dbSize.free_db_bytes)}</span>
+                            </div>
+                            <div className="bsm-stat-card">
+                                <span className="bsm-stat-label">WAL 文件</span>
+                                <span className="bsm-stat-value" style={{ fontSize: "1rem" }}>{formatBytes(dbSize.wal_bytes)}</span>
+                            </div>
+                            <div className="bsm-stat-card">
+                                <span className="bsm-stat-label">最近 {dbSize.days_window} 天新增行</span>
+                                <span className="bsm-stat-value" style={{ fontSize: "1rem" }}>{dbSize.recent_total_rows}</span>
+                            </div>
+                        </div>
+                        <div className="bsm-text-muted" style={{ fontSize: "0.8rem", marginBottom: "0.625rem" }}>
+                            生成时间: {dbSize.generated_at} | 后端: {dbSize.backend} / {dbSize.dialect} | 表数量: {dbSize.table_count}
+                        </div>
+                        <div className="bsm-table-wrap bsm-db-size-table-wrap">
+                            <table className="bsm-table">
+                                <thead>
+                                    <tr>
+                                        <th>表名</th>
+                                        <th>行数</th>
+                                        <th>近7天</th>
+                                        <th>表体积</th>
+                                        <th>索引体积</th>
+                                        <th>合计</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {dbSize.tables.length === 0 ? (
+                                        <tr>
+                                            <td colSpan={6} className="bsm-text-muted">暂无可展示数据</td>
+                                        </tr>
+                                    ) : dbSize.tables.map((row) => (
+                                        <tr key={row.name}>
+                                            <td>{row.name}</td>
+                                            <td>{row.row_count}</td>
+                                            <td>{row.recent_rows ?? "—"}</td>
+                                            <td>{formatBytes(row.table_bytes)}</td>
+                                            <td>{formatBytes(row.index_bytes)}</td>
+                                            <td>{formatBytes(row.total_bytes)}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </>
+                ) : (
+                    <div className="bsm-text-muted">尚未执行诊断。点击“开始诊断”获取当前数据库体积分析。</div>
+                )}
             </div>
 
         </Shell>

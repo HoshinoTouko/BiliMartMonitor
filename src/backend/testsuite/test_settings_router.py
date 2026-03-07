@@ -86,6 +86,50 @@ class SettingsRouterTestCase(unittest.TestCase):
         self.assertEqual(data["error"], "DB Connection Failed")
         mock_ping_database.assert_called_once_with()
 
+    @patch("bsm.db.get_database_size_report")
+    def test_db_size_diagnostics_success(self, mock_get_database_size_report: MagicMock) -> None:
+        mock_get_database_size_report.return_value = {
+            "generated_at": "2026-03-07T10:00:00Z",
+            "backend": "sqlite",
+            "dialect": "sqlite",
+            "days_window": 7,
+            "table_count": 3,
+            "total_rows": 120,
+            "recent_total_rows": 18,
+            "total_db_bytes": 1024,
+            "used_db_bytes": 768,
+            "free_db_bytes": 256,
+            "wal_bytes": 0,
+            "tables_total_bytes": 640,
+            "tables": [{"name": "c2c_items", "row_count": 100, "recent_rows": 16, "table_bytes": 500, "index_bytes": 120, "total_bytes": 620}],
+        }
+        response = self.client.get("/api/settings/db-size?days=14&top_n=10", auth=("testadmin", "admin"))
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["dialect"], "sqlite")
+        self.assertEqual(data["days_window"], 7)
+        self.assertEqual(len(data["tables"]), 1)
+        mock_get_database_size_report.assert_called_once_with(days=14, top_n=10)
+
+    @patch("bsm.db.get_database_size_report")
+    def test_db_size_diagnostics_error(self, mock_get_database_size_report: MagicMock) -> None:
+        mock_get_database_size_report.side_effect = RuntimeError("diagnostics unavailable")
+        response = self.client.get("/api/settings/db-size", auth=("testadmin", "admin"))
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"], "diagnostics unavailable")
+        mock_get_database_size_report.assert_called_once_with(days=7, top_n=20)
+
+    def test_db_size_diagnostics_rejects_invalid_params(self) -> None:
+        response = self.client.get("/api/settings/db-size?days=0", auth=("testadmin", "admin"))
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"], "days must be between 1 and 3650")
+
+        response = self.client.get("/api/settings/db-size?top_n=0", auth=("testadmin", "admin"))
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"], "top_n must be between 1 and 200")
+
     def test_update_settings_accepts_continue_until_repeat_scan_mode(self) -> None:
         response = self.client.put(
             "/api/settings",
@@ -353,6 +397,12 @@ class SettingsRouterTestCase(unittest.TestCase):
 
     def test_regular_user_cannot_access_system_settings(self) -> None:
         response = self.client.get("/api/settings", auth=("demo", "user1234"))
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], "Admin privileges required")
+
+    def test_regular_user_cannot_access_db_size_diagnostics(self) -> None:
+        response = self.client.get("/api/settings/db-size", auth=("demo", "user1234"))
 
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()["detail"], "Admin privileges required")
