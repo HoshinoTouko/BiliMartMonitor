@@ -70,11 +70,6 @@ PYTHONPATH=src ./.venv/bin/python src/bsm-cli/login.py
 
 `run-backend.sh` 会在启动前自动执行：
 - `alembic upgrade head`
-- `python3 src/bsm-cli/migrate_product_snapshot.py`
-
-可选环境变量：
-- `BSM_RUN_DATA_MIGRATION=0` 跳过数据迁移
-- `BSM_DATA_MIGRATION_RESET=1` 先重置 `product` / `c2c_items_snapshot` 再回填
 
 前端开发启动：
 

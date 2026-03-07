@@ -17,7 +17,6 @@ class AccessUser(Base):
     username: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     display_name: Mapped[Optional[str]] = mapped_column(Text)
     password_hash: Mapped[Optional[str]] = mapped_column(Text)
-    telegram_id: Mapped[Optional[str]] = mapped_column(Text)
     telegram_ids_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]", server_default=text("'[]'")
     )

@@ -4,6 +4,7 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import Shell from "@/components/Shell";
 import { apiGet } from "@/lib/api";
+import { formatMonthDayTime, timeAgo as timeAgoFromApiDate } from "@/lib/datetime";
 import {
     ScatterChart,
     Scatter,
@@ -54,15 +55,8 @@ interface ChartDataPoint {
     c2c_items_id?: number;
 }
 
-function timeAgo(dt: string | null): string {
-    if (!dt) return "—";
-    const date = new Date(dt.replace(" ", "T"));
-    const diff = Math.floor((Date.now() - date.getTime()) / 1000);
-    if (diff < 0) return "刚刚";
-    if (diff < 60) return `${diff} 秒前`;
-    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-    return `${Math.floor(diff / 86400)} 天前`;
+function timeAgo(dt: string | number | null): string {
+    return timeAgoFromApiDate(dt, "—");
 }
 
 // Custom tooltip for the chart
@@ -91,9 +85,8 @@ const ChartTooltip = ({
     );
 };
 
-function formatDate(dt: string): string {
-    const d = new Date(dt.replace(" ", "T"));
-    return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+function formatDate(dt: string | number): string {
+    return formatMonthDayTime(dt, "—");
 }
 
 export default function ProductDetailPage() {

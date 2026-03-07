@@ -29,6 +29,7 @@ if _SRC_ROOT not in sys.path:
 
 from bsm import db  # noqa: E402
 from bsm import settings
+from bsm.passwords import is_password_hash, verify_password
 
 security = HTTPBasic(auto_error=False)
 
@@ -81,8 +82,31 @@ def authenticate_access_user(username: str, password: str) -> Optional[Dict[str,
         return None
     if str(user.get("status") or "") != "active":
         return None
-    if str(user.get("password_hash") or "") != (password or ""):
+    stored_password = str(user.get("password_hash") or "")
+    plain_password = str(password or "")
+    password_ok = False
+    needs_upgrade = False
+    if is_password_hash(stored_password):
+        password_ok = verify_password(plain_password, stored_password)
+    else:
+        password_ok = stored_password == plain_password
+        needs_upgrade = password_ok and bool(stored_password)
+    if not password_ok:
         return None
+    if needs_upgrade:
+        settings.upsert_access_user(
+            username=str(user.get("username") or ""),
+            display_name=str(user.get("display_name") or ""),
+            password_hash=plain_password,
+            telegram_ids=user.get("telegram_ids") or [],
+            keywords=user.get("keywords") or [],
+            roles=user.get("roles") or [],
+            status=str(user.get("status") or "active"),
+            notify_enabled=bool(user.get("notify_enabled", True)),
+        )
+        refreshed = settings.get_access_user(username)
+        if refreshed:
+            user = refreshed
     roles = user.get("roles") or []
     role = "admin" if "admin" in roles else "user"
     return {

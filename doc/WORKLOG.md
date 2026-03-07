@@ -1,5 +1,52 @@
 # Work Log
 
+## 2026-03-07 DB Repair UX, Password Security, Timestamp Standardization, and Alembic Squash
+
+### Planned
+
+- Align admin DB diagnostics and orphan-repair workflow with production behavior.
+- Replace plaintext password storage with secure hashing and legacy auto-upgrade.
+- Standardize time fields to UTC millisecond TIMESTAMP-compatible strings and fix frontend parsing compatibility.
+- Remove risky one-time migration execution paths and collapse Alembic history into one init revision.
+
+### Step Log
+
+1. Updated admin settings UX:
+   - renamed diagnostics section to `数据库诊断`,
+   - added repair progress polling integration and "running/attach" handling,
+   - added log auto-refresh pause/resume control.
+2. Reworked orphan repair flow (`db-prune-orphans`) to:
+   - scan orphan rows only (not all rows),
+   - process newest -> oldest in batches of 2000,
+   - return real scanned/processed counters and detailed error samples.
+3. Added detail parsing fallback paths:
+   - blob parse fallback to legacy `detail_json` for orphan repair,
+   - robust decode support for mixed storage forms (plain JSON / gzip / text/base64 historical forms).
+4. Removed startup execution of legacy migration script from `scripts/run-backend.sh`.
+5. Deleted legacy data migration CLI (`src/bsm-cli/migrate_product_snapshot.py`) and added `normalize_detail_blob_storage.py` for explicit operator-triggered normalization.
+6. Added password hashing module `src/bsm/passwords.py` and integrated:
+   - hash-on-write in `upsert_access_user`,
+   - verify-on-login in auth flow,
+   - auto-upgrade of legacy plaintext password rows on successful login.
+7. Removed runtime usage of legacy `telegram_id` user field.
+8. Standardized `_now`, `_utc_cutoff`, `_snapshot_now` to UTC millisecond strings (`...SS.mmmZ`) for TIMESTAMP-compatible precision.
+9. Squashed Alembic revisions into `alembic/versions/0001_init.py` and removed legacy migration files.
+10. Added frontend shared datetime parser `src/frontend/src/lib/datetime.ts` and replaced page-level manual parsing in:
+    - `/app`,
+    - `/admin/settings`,
+    - `/market`,
+    - `/market/[id]`,
+    - `/product/[id]`.
+11. Added regression tests:
+    - `test_password_security.py`,
+    - `test_frontend_datetime_usage.py`.
+
+### Verification
+
+- `pytest -q` -> `167 passed`
+- `pnpm lint` in `src/frontend` -> passed
+- `alembic heads` -> `0001_init (head)`
+
 ## 2026-03-07 Snapshot Reverse FK + ORM Backrefs
 
 ### Planned
@@ -56,17 +103,12 @@
    - writes `c2c_items_snapshot` rows with proportional `est_price`,
    - keeps legacy `c2c_items_details` writes for transition period.
 7. Updated `src/backend/backfill_details.py` to read details from blob first.
-8. Added backfill executor `src/bsm-cli/migrate_product_snapshot.py`:
-   - optional `--reset`,
-   - backfills `detail_blob`,
-   - migrates data to `product` and `c2c_items_snapshot`,
-   - preserves legacy timeline from `c2c_items_details` with nullable triple fields.
-9. Executed migration script locally (`--reset`) on current scan DB and verified row counts.
+8. Added (historical) one-time backfill executor for blob/product/snapshot migration.
+9. Executed historical migration flow locally and verified row counts.
 
 ### Verification
 
-- `python3 -m compileall src/bsm/db.py src/bsm/orm_models.py src/backend/backfill_details.py src/bsm-cli/migrate_product_snapshot.py alembic/versions/e1a5c9d2b741_add_product_snapshot_and_blob_columns.py`
-- `python3 src/bsm-cli/migrate_product_snapshot.py --reset`
+- `python3 -m compileall src/bsm/db.py src/bsm/orm_models.py src/backend/backfill_details.py alembic/versions/e1a5c9d2b741_add_product_snapshot_and_blob_columns.py`
 - Post-check counts:
   - `product`: `2392`
   - `c2c_items_snapshot`: `5274`

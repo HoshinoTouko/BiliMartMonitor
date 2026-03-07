@@ -130,6 +130,49 @@ class SettingsRouterTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"], "top_n must be between 1 and 200")
 
+    @patch("bsm.db.prune_orphan_old_market_data")
+    def test_db_prune_orphans_success(self, mock_prune_orphan_old_market_data: MagicMock) -> None:
+        mock_prune_orphan_old_market_data.return_value = {
+            "ok": True,
+            "dialect": "sqlite",
+            "batch_size": 2000,
+            "scanned_items": 2000,
+            "success_count": 1898,
+            "skipped_count": 102,
+            "created_products": 2210,
+            "created_snapshots": 5140,
+        }
+        response = self.client.post("/api/settings/db-prune-orphans", auth=("testadmin", "admin"))
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["success_count"], 1898)
+        self.assertEqual(data["created_snapshots"], 5140)
+        mock_prune_orphan_old_market_data.assert_called_once_with()
+
+    @patch("backend.routers.settings.threading.Thread")
+    def test_db_prune_orphans_start_success(self, mock_thread: MagicMock) -> None:
+        thread_instance = MagicMock()
+        mock_thread.return_value = thread_instance
+
+        response = self.client.post("/api/settings/db-prune-orphans/start", auth=("testadmin", "admin"))
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["ok"])
+        self.assertIn("job_id", data)
+        mock_thread.assert_called_once()
+        thread_instance.start.assert_called_once_with()
+
+    def test_db_prune_orphans_status_success(self) -> None:
+        response = self.client.get("/api/settings/db-prune-orphans/status", auth=("testadmin", "admin"))
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("is_running", data)
+        self.assertIn("progress_percent", data)
+
     def test_update_settings_accepts_continue_until_repeat_scan_mode(self) -> None:
         response = self.client.put(
             "/api/settings",

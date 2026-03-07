@@ -39,23 +39,6 @@ else
     echo "         Run: src/backend/.venv/bin/pip install alembic"
 fi
 
-# ---------------------------------------------------------------------------
-# Run data migration (product + c2c_items_snapshot + detail_blob backfill)
-# ---------------------------------------------------------------------------
-RUN_DATA_MIGRATION="${BSM_RUN_DATA_MIGRATION:-1}"
-if [ "$RUN_DATA_MIGRATION" = "1" ]; then
-  echo "Running data migration for product/snapshot/blob..."
-  if [ "${BSM_DATA_MIGRATION_RESET:-0}" = "1" ]; then
-    echo "  BSM_DATA_MIGRATION_RESET=1 -> migration will reset product/snapshot tables first"
-    PYTHONPATH=src "$PYTHON_BIN" src/bsm-cli/migrate_product_snapshot.py --reset
-  else
-    PYTHONPATH=src "$PYTHON_BIN" src/bsm-cli/migrate_product_snapshot.py
-  fi
-else
-  echo "Skipping data migration (BSM_RUN_DATA_MIGRATION=$RUN_DATA_MIGRATION)"
-fi
-
-
 echo "Starting FastAPI backend on http://localhost:8000 …"
 echo "  Press Ctrl+C to stop."
 echo ""

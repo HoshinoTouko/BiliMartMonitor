@@ -1,4 +1,6 @@
 import os
+import json
+import gzip
 import sqlite3
 import sys
 import tempfile
@@ -17,7 +19,7 @@ if SRC_ROOT not in sys.path:
 
 from bsm import db
 from bsm import settings
-from bsm.orm_models import C2CItem, C2CItemSnapshot
+from bsm.orm_models import C2CItem, C2CItemSnapshot, Product
 
 
 class DatabaseTestCase(unittest.TestCase):
@@ -241,6 +243,48 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertIn(10000, prices)
         self.assertIn(15000, prices)
 
+    def test_prune_orphan_old_market_data_rebuilds_product_snapshot_with_created_at(self) -> None:
+        created_at = "2026-01-02T03:04:05Z"
+        detail_blob = db._encode_detail_blob(
+            [
+                {
+                    "itemsId": 9001,
+                    "blindBoxId": 100,
+                    "skuId": 200,
+                    "name": "Legacy Product",
+                    "img": "https://example.com/p.png",
+                    "marketPrice": 300,
+                }
+            ]
+        )
+        backend = db._require_sqlalchemy_backend()
+        with backend.session() as session:
+            session.add(
+                C2CItem(
+                    c2c_items_id=88001,
+                    c2c_items_name="Legacy Item",
+                    price=12345,
+                    created_at=created_at,
+                    updated_at="2026-02-01T00:00:00Z",
+                    detail_blob=detail_blob,
+                )
+            )
+
+        result = db.prune_orphan_old_market_data()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["success_count"], 1)
+        self.assertEqual(result["created_products"], 1)
+        self.assertEqual(result["created_snapshots"], 1)
+
+        with backend.session() as session:
+            product = session.query(Product).filter(Product.items_id == 9001, Product.sku_id == 200).first()
+            self.assertIsNotNone(product)
+            self.assertEqual(product.created_at, created_at)
+            self.assertEqual(product.updated_at, created_at)
+            snap = session.query(C2CItemSnapshot).filter(C2CItemSnapshot.c2c_items_id == 88001).first()
+            self.assertIsNotNone(snap)
+            self.assertEqual(snap.snapshot_at, created_at)
+
     def test_item_details_incremental_snapshots_use_latest_for_queries(self) -> None:
         db.save_items(
             [
@@ -435,6 +479,11 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(user["telegram_ids"], ["123456"])
         self.assertEqual(user["keywords"], ["无职转生", "洛琪希"])
         self.assertEqual(user["roles"], ["admin", "operator"])
+        password_hash = str(user.get("password_hash") or "")
+        self.assertTrue(password_hash.startswith("pbkdf2_sha256$"))
+        parts = password_hash.split("$")
+        self.assertEqual(len(parts), 4)
+        self.assertEqual(len(parts[2]), 32)
 
     def test_runtime_settings_are_written_to_yaml_and_ignore_env(self) -> None:
         os.environ["BSM_SCAN_MODE"] = "continue"
@@ -538,79 +587,9 @@ class AlembicMigrationTestCase(unittest.TestCase):
         if os.path.exists(self.env_path):
             os.remove(self.env_path)
 
-    def test_alembic_upgrade_migrates_legacy_user_sessions(self) -> None:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            conn.execute(
-                """
-                CREATE TABLE access_users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT NOT NULL UNIQUE,
-                    display_name TEXT,
-                    password_hash TEXT,
-                    telegram_id TEXT,
-                    keywords_json TEXT NOT NULL DEFAULT '[]',
-                    roles_json TEXT NOT NULL DEFAULT '[]',
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO access_users (username, telegram_id, keywords_json, roles_json)
-                VALUES ('admin', '123456', '[]', '[\"admin\"]')
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE user_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_name TEXT,
-                    login_username TEXT,
-                    cookies TEXT NOT NULL,
-                    created_by TEXT,
-                    status TEXT,
-                    fetch_count INTEGER,
-                    login_at DATETIME,
-                    last_success_fetch_at DATETIME,
-                    last_used_at DATETIME,
-                    last_checked_at DATETIME,
-                    last_error TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO user_sessions (
-                    session_name, login_username, cookies, created_by, status, fetch_count,
-                    login_at, last_success_fetch_at, last_used_at, last_checked_at, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "legacy-name",
-                    "",
-                    "cookie-a",
-                    "admin",
-                    "active",
-                    5,
-                    "2026-03-01T00:00:00Z",
-                    "2026-03-01T01:00:00Z",
-                    None,
-                    None,
-                    None,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
+    def test_alembic_upgrade_initializes_init_schema(self) -> None:
         os.environ["BSM_DB_BACKEND"] = "sqlite"
         os.environ["BSM_SQLITE_PATH"] = self.db_path
-        
         with open(self.env_path, "w", encoding="utf-8") as f:
             f.write("BSM_DB_BACKEND=sqlite\n")
             f.write(f"BSM_SQLITE_PATH={self.db_path}\n")
@@ -621,98 +600,29 @@ class AlembicMigrationTestCase(unittest.TestCase):
         conn = sqlite3.connect(self.db_path)
         try:
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            self.assertIn("bili_sessions", tables)
-            self.assertNotIn("user_sessions", tables)
+            for required in (
+                "access_users",
+                "bili_sessions",
+                "c2c_items",
+                "product",
+                "c2c_items_snapshot",
+                "system_metadata",
+                "alembic_version",
+            ):
+                self.assertIn(required, tables)
+            self.assertNotIn("c2c_items_details", tables)
+            self.assertNotIn("c2c_price_history", tables)
 
-            access_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(access_users)").fetchall()
-            }
+            access_columns = {row[1] for row in conn.execute("PRAGMA table_info(access_users)").fetchall()}
             self.assertIn("telegram_ids_json", access_columns)
-            self.assertIn("notify_enabled", access_columns)
-
-            migrated = conn.execute(
-                """
-                SELECT login_username, cookies, created_by, fetch_count, login_at, last_success_fetch_at
-                FROM bili_sessions
-                """
-            ).fetchone()
-            self.assertIsNotNone(migrated)
-            self.assertEqual(migrated[0], "legacy-name")
-            self.assertEqual(migrated[1], "cookie-a")
-            self.assertEqual(migrated[2], "admin")
-            self.assertEqual(migrated[3], 5)
-            self.assertEqual(migrated[4], "2026-03-01T00:00:00Z")
-            self.assertEqual(migrated[5], "2026-03-01T01:00:00Z")
-
-            telegram_ids_json = conn.execute(
-                "SELECT telegram_ids_json FROM access_users WHERE username = 'admin'"
-            ).fetchone()
-            self.assertEqual(telegram_ids_json[0], "[\"123456\"]")
+            self.assertIn("password_hash", access_columns)
+            self.assertNotIn("telegram_id", access_columns)
         finally:
             conn.close()
 
-    def test_alembic_upgrade_drops_legacy_c2c_items_details_table(self) -> None:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            conn.execute(
-                """
-                CREATE TABLE c2c_items (
-                    c2c_items_id INTEGER PRIMARY KEY,
-                    updated_at TEXT,
-                    created_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE c2c_items_details (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    c2c_items_id INTEGER NOT NULL,
-                    items_id INTEGER NOT NULL,
-                    name TEXT,
-                    img_url TEXT,
-                    market_price INTEGER
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE c2c_price_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    c2c_items_id INTEGER NOT NULL,
-                    price INTEGER,
-                    show_price TEXT,
-                    recorded_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO c2c_items (c2c_items_id, updated_at, created_at)
-                VALUES (9001, '2026-03-05T00:00:00Z', '2026-03-05T00:00:00Z')
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO c2c_items_details (c2c_items_id, items_id, name, img_url, market_price)
-                VALUES (9001, 501, 'Legacy Detail', 'https://example.com/a.png', 100)
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO c2c_price_history (c2c_items_id, price, show_price, recorded_at)
-                VALUES
-                    (9001, 10000, '100.00', '2026-03-01T00:00:00Z'),
-                    (9001, 9800, '98.00', '2026-03-02T00:00:00Z')
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
+    def test_alembic_upgrade_records_single_init_revision(self) -> None:
         os.environ["BSM_DB_BACKEND"] = "sqlite"
         os.environ["BSM_SQLITE_PATH"] = self.db_path
-
         with open(self.env_path, "w", encoding="utf-8") as f:
             f.write("BSM_DB_BACKEND=sqlite\n")
             f.write(f"BSM_SQLITE_PATH={self.db_path}\n")
@@ -722,10 +632,9 @@ class AlembicMigrationTestCase(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         try:
-            table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            self.assertNotIn("c2c_items_details", table_names)
-            self.assertNotIn("c2c_price_history", table_names)
-            self.assertIn("c2c_items_snapshot", table_names)
+            row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], "0001_init")
         finally:
             conn.close()
 

@@ -305,6 +305,19 @@ class AuthEnforcementTestCase(unittest.TestCase):
             self.assertIsNotNone(user)
             self.assertEqual(user["username"], "admin")
             self.assertEqual(user["role"], "admin")
+            from bsm.settings import get_access_user
+            stored = get_access_user("admin")
+            self.assertIsNotNone(stored)
+            self.assertNotEqual(stored.get("password_hash"), "admin")
+            password_hash = str(stored.get("password_hash") or "")
+            self.assertTrue(password_hash.startswith("pbkdf2_sha256$"))
+            parts = password_hash.split("$")
+            self.assertEqual(len(parts), 4)
+            self.assertTrue(parts[2])
+            self.assertEqual(len(parts[2]), 32)
+            int(parts[1])
+            int(parts[2], 16)
+            int(parts[3], 16)
         finally:
             os.environ["BSM_TEST_DB_PATH"] = old_db_path
             os.environ["BSM_CONFIG_PATH"] = old_cfg_path

@@ -9,7 +9,9 @@ Routes:
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -29,6 +31,25 @@ router = APIRouter()
 
 _ALL_PRICE_FILTERS = ["0-2000", "2000-3000", "3000-5000", "5000-10000", "10000-20000", "20000-0"]
 _ALL_DISCOUNT_FILTERS = ["70-100", "50-70", "30-50", "0-30"]
+_db_repair_lock = threading.Lock()
+_db_repair_status: Dict[str, Any] = {
+    "job_id": None,
+    "is_running": False,
+    "started_at": None,
+    "finished_at": None,
+    "processed_items": 0,
+    "total_items": 0,
+    "success_count": 0,
+    "skipped_count": 0,
+    "created_products": 0,
+    "created_snapshots": 0,
+    "skipped_empty_detail": 0,
+    "skipped_without_items_id": 0,
+    "fallback_detail_json_used": 0,
+    "error_count": 0,
+    "error_samples": [],
+    "error": None,
+}
 
 
 def _unauthorized() -> JSONResponse:
@@ -314,6 +335,121 @@ def api_db_size_diagnostics(
         return JSONResponse(report)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/api/settings/db-prune-orphans")
+def api_db_prune_orphans(
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    from bsm.db import prune_orphan_old_market_data
+
+    try:
+        result = prune_orphan_old_market_data()
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _db_repair_progress_update(payload: Dict[str, Any]) -> None:
+    with _db_repair_lock:
+        _db_repair_status["processed_items"] = int(payload.get("processed_items") or 0)
+        _db_repair_status["total_items"] = int(payload.get("total_items") or 0)
+        _db_repair_status["success_count"] = int(payload.get("success_count") or 0)
+        _db_repair_status["skipped_count"] = int(payload.get("skipped_count") or 0)
+        _db_repair_status["created_products"] = int(payload.get("created_products") or 0)
+        _db_repair_status["created_snapshots"] = int(payload.get("created_snapshots") or 0)
+
+
+def _run_db_repair_job(job_id: str) -> None:
+    from bsm.db import repair_orphan_market_data_batch
+
+    try:
+        result = repair_orphan_market_data_batch(limit=2000, progress_cb=_db_repair_progress_update)
+        with _db_repair_lock:
+            _db_repair_status.update(
+                {
+                    "job_id": job_id,
+                    "is_running": False,
+                    "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "processed_items": int(result.get("scanned_items") or 0),
+                    "total_items": int(result.get("scanned_items") or 0),
+                    "success_count": int(result.get("success_count") or 0),
+                    "skipped_count": int(result.get("skipped_count") or 0),
+                    "created_products": int(result.get("created_products") or 0),
+                    "created_snapshots": int(result.get("created_snapshots") or 0),
+                    "skipped_empty_detail": int(result.get("skipped_empty_detail") or 0),
+                    "skipped_without_items_id": int(result.get("skipped_without_items_id") or 0),
+                    "fallback_detail_json_used": int(result.get("fallback_detail_json_used") or 0),
+                    "error_count": int(result.get("error_count") or 0),
+                    "error_samples": list(result.get("error_samples") or []),
+                    "orphan_total_before_batch": int(result.get("orphan_total_before_batch") or 0),
+                    "scanned_orphan_items": int(result.get("scanned_orphan_items") or result.get("scanned_items") or 0),
+                    "remaining_orphan_items": int(result.get("remaining_orphan_items") or 0),
+                    "remaining_orphan_snapshots": int(result.get("remaining_orphan_snapshots") or 0),
+                    "error": None,
+                }
+            )
+    except Exception as exc:
+        with _db_repair_lock:
+            _db_repair_status.update(
+                {
+                    "job_id": job_id,
+                    "is_running": False,
+                    "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "error": str(exc),
+                }
+            )
+
+
+@router.post("/api/settings/db-prune-orphans/start")
+def api_start_db_prune_orphans(
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    with _db_repair_lock:
+        if _db_repair_status.get("is_running"):
+            return JSONResponse({"error": "repair job is already running"}, status_code=409)
+        job_id = uuid.uuid4().hex
+        _db_repair_status.update(
+            {
+                "job_id": job_id,
+                "is_running": True,
+                "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "finished_at": None,
+                "processed_items": 0,
+                "total_items": 0,
+                "success_count": 0,
+                "skipped_count": 0,
+                "created_products": 0,
+                "created_snapshots": 0,
+                "skipped_empty_detail": 0,
+                "skipped_without_items_id": 0,
+                "fallback_detail_json_used": 0,
+                "error_count": 0,
+                "error_samples": [],
+                "orphan_total_before_batch": 0,
+                "scanned_orphan_items": 0,
+                "remaining_orphan_items": None,
+                "remaining_orphan_snapshots": None,
+                "error": None,
+            }
+        )
+    threading.Thread(target=_run_db_repair_job, args=(job_id,), daemon=True).start()
+    return JSONResponse({"ok": True, "job_id": job_id})
+
+
+@router.get("/api/settings/db-prune-orphans/status")
+def api_status_db_prune_orphans(
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    with _db_repair_lock:
+        data = dict(_db_repair_status)
+    total_items = int(data.get("total_items") or 0)
+    processed_items = int(data.get("processed_items") or 0)
+    progress_percent = 0
+    if total_items > 0:
+        progress_percent = max(0, min(100, int(round((processed_items * 100) / total_items))))
+    data["progress_percent"] = progress_percent
+    return JSONResponse(data)
 
 
 @router.put("/api/settings")

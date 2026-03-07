@@ -1,12 +1,49 @@
 # Changelog
 
+## [0.9.4] — 2026-03-07
+
+### Added
+
+- **Orphan Repair Async Progress API**: Added async repair endpoints for orphan `c2c_items` with start/status flow and real progress counters (`N/2000`) from newest to oldest:
+  - `POST /api/settings/db-prune-orphans/start`
+  - `GET /api/settings/db-prune-orphans/status`
+- **Repair Observability**: Repair result now includes detailed counters and sampled errors (including empty detail / missing `itemsId` / parse failures) for easier diagnosis.
+- **Frontend Shared Datetime Parser**: Added `src/frontend/src/lib/datetime.ts` to parse mixed backend time formats:
+  - ISO/TIMESTAMP strings with milliseconds,
+  - SQL-style datetime strings,
+  - epoch seconds/milliseconds as number/string.
+- **Password Hashing Module**: Added `src/bsm/passwords.py` (`pbkdf2_sha256`) and integrated password hash verification/upgrade flow.
+
+### Changed
+
+- **Database Diagnostics UI**: Renamed "数据库体积诊断" section to "数据库诊断", and enhanced diagnostics rendering/estimation behavior for SQLite/D1 environments that do not expose full table/index stats.
+- **Frontend Time Rendering**: Replaced ad-hoc `new Date(...replace(" ", "T"))` parsing in market/product/admin/dashboard pages with shared helper to avoid timestamp parsing drift.
+- **Security Model**: `access_users.password_hash` is no longer stored as plaintext for new writes; legacy plaintext rows are auto-upgraded to PBKDF2 hash on successful login.
+- **User Schema Cleanup**: Removed legacy `telegram_id` field usage from runtime user model.
+- **Schema Baseline Strategy**: Squashed historical Alembic chain into a single baseline migration `0001_init` and removed legacy migration files.
+- **Runtime Scripts**: Removed historical one-time data migration runner from startup path; kept command path but deleted migration execution behavior.
+
+### Removed
+
+- **Legacy Migration Script**: Deleted `src/bsm-cli/migrate_product_snapshot.py` to avoid accidental execution in fresh deployments.
+- **Legacy Alembic Revisions**: Removed old migration files after squash to `0001_init`.
+
+### Tests
+
+- Added password security tests:
+  - hash/verify roundtrip,
+  - plaintext write auto-hash,
+  - legacy plaintext login auto-upgrade.
+- Added frontend datetime usage regression tests to ensure pages use shared parser and keep epoch-compatible parsing.
+- Full backend suite passes (`167 passed`), frontend lint passes.
+
 ## [0.9.3] — 2026-03-07
 
 ### Added
 
 - **Product Triple Table**: Added new `product` table keyed by `(blindbox_id, items_id, sku_id)` for normalized product metadata (`name`, `img_url`, `market_price`).
 - **Snapshot Table**: Added `c2c_items_snapshot` table to store per-listing component snapshots and proportional estimated prices over time.
-- **BLOB Compression Migration Script**: Added `src/bsm-cli/migrate_product_snapshot.py` to backfill `detail_blob` and migrate legacy data into `product` and `c2c_items_snapshot`.
+- **BLOB Compression Migration Script**: (removed in current branch) legacy backfill script was previously used for one-time migration.
 - **Migration Plan Doc**: Added `doc/C2C_PRODUCT_SNAPSHOT_BLOB_MIGRATION.md` documenting phased rollout, validation, and rollback.
 - **Snapshot Reverse FK Migration**: Added alembic migration `d1f3a6b8c901_add_fk_from_snapshot_to_c2c_items.py` to enforce `c2c_items_snapshot.c2c_items_id -> c2c_items.c2c_items_id` with `ON DELETE CASCADE`.
 

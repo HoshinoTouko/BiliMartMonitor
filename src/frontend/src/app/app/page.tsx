@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import Shell from "@/components/Shell";
 import { useAuth } from "@/contexts/AuthContext";
 import { apiGet } from "@/lib/api";
+import { timeAgo as timeAgoFromApiDate } from "@/lib/datetime";
 
 interface DashboardStats {
     ok: boolean;
@@ -16,12 +17,7 @@ interface DashboardStats {
 }
 
 function timeAgo(iso: string | null): string {
-    if (!iso) return "暂无";
-    const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
-    if (diff < 0) return "刚刚";
-    if (diff < 60) return `${diff} 秒前`;
-    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-    return `${Math.floor(diff / 3600)} 小时前`;
+    return timeAgoFromApiDate(iso, "暂无");
 }
 
 export default function UserDashboardPage() {

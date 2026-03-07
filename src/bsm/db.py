@@ -1,4 +1,5 @@
 import gzip
+import base64
 import json
 import os
 import re
@@ -10,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy import and_, case, create_engine, delete, event, func, literal, or_, select, true
@@ -18,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, aliased, sessionmaker
 from .env import data_dir, env_int, env_str, load_dotenv, resolve_project_path
+from .passwords import hash_password, is_password_hash
 from .orm_models import (
     AccessUser,
     Base,
@@ -47,20 +49,21 @@ def _positive_int(value: Any, default: int) -> int:
 
 def _now() -> str:
     from datetime import datetime, timezone
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(now.microsecond / 1000):03d}Z"
 
 
 def _utc_cutoff(*, seconds: int = 0, hours: int = 0, days: int = 0) -> str:
     from datetime import datetime, timedelta, timezone
 
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds, hours=hours, days=days)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    dt = datetime.now(timezone.utc) - timedelta(seconds=seconds, hours=hours, days=days)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(dt.microsecond / 1000):03d}Z"
 
 
 def _snapshot_now() -> str:
-    """Use microsecond precision to avoid snapshot timestamp collisions."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    """Use millisecond precision timestamp in UTC."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(now.microsecond / 1000):03d}Z"
 
 
 def _load_bili_session_runtime_settings() -> Dict[str, Any]:
@@ -386,17 +389,118 @@ def _encode_detail_blob(detail_list: List[Dict[str, Any]]) -> bytes:
     return gzip.compress(raw, compresslevel=6)
 
 
+def _normalize_detail_payload(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("detailDtoList", "detail_list", "details", "items", "list"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("detailDtoList", "detail_list", "details", "items", "list"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+    return []
+
+
 def _decode_detail_blob(detail_blob: Any) -> List[Dict[str, Any]]:
     if not detail_blob:
         return []
-    try:
+    parsed, _ = _decode_detail_blob_with_reason(detail_blob)
+    return parsed
+
+
+def _decode_detail_blob_with_reason(detail_blob: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not detail_blob:
+        return [], "blob_empty"
+
+    blob_bytes: Optional[bytes] = None
+    if isinstance(detail_blob, memoryview):
+        blob_bytes = detail_blob.tobytes()
+    elif isinstance(detail_blob, (bytes, bytearray)):
         blob_bytes = bytes(detail_blob)
+    elif isinstance(detail_blob, str):
+        text = detail_blob.strip()
+        if not text:
+            return [], "blob_text_empty"
+        # Case 1: plain JSON string
+        try:
+            parsed = json.loads(text)
+            normalized = _normalize_detail_payload(parsed)
+            if normalized:
+                return normalized, None
+        except Exception:
+            pass
+        # Case 2: base64(gzip(json))
+        try:
+            blob_bytes = base64.b64decode(text, validate=False)
+        except Exception:
+            blob_bytes = text.encode("utf-8", errors="ignore")
+    else:
+        try:
+            blob_bytes = bytes(detail_blob)
+        except Exception:
+            return [], f"blob_bytes_convert_failed:{type(detail_blob).__name__}"
+
+    if blob_bytes is None:
+        return [], "blob_bytes_none"
+
+    try:
+        parsed = json.loads(gzip.decompress(blob_bytes).decode("utf-8"))
+        normalized = _normalize_detail_payload(parsed)
+        if normalized:
+            return normalized, None
     except Exception:
+        pass
+    # Some deployments store base64(gzip(json)) as ASCII bytes in BLOB/TEXT.
+    try:
+        text = blob_bytes.decode("ascii").strip()
+        if text:
+            decoded_b64 = base64.b64decode(text, validate=False)
+            try:
+                parsed = json.loads(gzip.decompress(decoded_b64).decode("utf-8"))
+                normalized = _normalize_detail_payload(parsed)
+                if normalized:
+                    return normalized, None
+            except Exception:
+                pass
+            try:
+                parsed = json.loads(decoded_b64.decode("utf-8"))
+                normalized = _normalize_detail_payload(parsed)
+                if normalized:
+                    return normalized, None
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        parsed = json.loads(blob_bytes.decode("utf-8"))
+        normalized = _normalize_detail_payload(parsed)
+        if normalized:
+            return normalized, None
+        return [], f"blob_json_unrecognized_shape:{type(parsed).__name__}"
+    except Exception:
+        return [], "blob_decode_failed"
+
+
+def _decode_detail_json_text(detail_json: Any) -> List[Dict[str, Any]]:
+    if detail_json is None:
         return []
     try:
-        return json.loads(gzip.decompress(blob_bytes).decode("utf-8"))
+        text = str(detail_json)
     except Exception:
         return []
+    if not text.strip():
+        return []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return []
+    normalized = _normalize_detail_payload(parsed)
+    return normalized if normalized else []
 
 
 def _extract_img_from_detail_items(data: Any) -> str:
@@ -801,6 +905,16 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                     sqlite_dbstat_map[name] = int(row[1] or 0)
             except Exception:
                 sqlite_dbstat_map = {}
+                try:
+                    conn.execute(sa.text("CREATE VIRTUAL TABLE temp.bsm_dbstat USING dbstat(main)"))
+                    rows = conn.execute(sa.text("SELECT name, SUM(pgsize) AS total_bytes FROM temp.bsm_dbstat GROUP BY name")).all()
+                    for row in rows:
+                        name = str(row[0] or "").strip()
+                        if not name:
+                            continue
+                        sqlite_dbstat_map[name] = int(row[1] or 0)
+                except Exception:
+                    sqlite_dbstat_map = {}
         elif dialect == "postgresql":
             postgres_total_bytes = int(conn.execute(sa.text("SELECT pg_database_size(current_database())")).scalar() or 0)
 
@@ -916,6 +1030,55 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                     conn.execute(sa.text("SELECT COALESCE(pg_indexes_size(to_regclass(:rel)), 0)"), {"rel": relation_name}).scalar() or 0
                 )
                 total_relation_bytes = table_bytes + index_bytes
+            elif backend_name == "cloudflare" or dialect == "cloudflare_d1":
+                # D1 does not expose per-table bytes directly; estimate by row payload and index key width.
+                quoted_columns = [
+                    identifier_preparer.quote(str(col.get("name") or ""))
+                    for col in inspector.get_columns(table_name)
+                    if str(col.get("name") or "").strip()
+                ]
+                avg_row_payload = 0.0
+                if quoted_columns:
+                    sum_expr = " + ".join(f"COALESCE(LENGTH(CAST({col_name} AS BLOB)), 0)" for col_name in quoted_columns)
+                    try:
+                        avg_row_payload = float(
+                            conn.execute(
+                                sa.text(f"SELECT COALESCE(AVG({sum_expr}), 0) FROM {quoted_table}")
+                            ).scalar()
+                            or 0.0
+                        )
+                    except Exception:
+                        avg_row_payload = 0.0
+                row_overhead = 24.0
+                table_bytes = int(max(0.0, (avg_row_payload + row_overhead) * float(row_count)))
+
+                idx_total = 0.0
+                try:
+                    idx_defs = inspector.get_indexes(table_name)
+                except Exception:
+                    idx_defs = []
+                for idx_def in idx_defs:
+                    col_names = [
+                        identifier_preparer.quote(str(name))
+                        for name in (idx_def.get("column_names") or [])
+                        if str(name or "").strip()
+                    ]
+                    if not col_names:
+                        continue
+                    idx_expr = " + ".join(f"COALESCE(LENGTH(CAST({col_name} AS BLOB)), 0)" for col_name in col_names)
+                    try:
+                        avg_key_payload = float(
+                            conn.execute(
+                                sa.text(f"SELECT COALESCE(AVG({idx_expr}), 0) FROM {quoted_table}")
+                            ).scalar()
+                            or 0.0
+                        )
+                    except Exception:
+                        avg_key_payload = 0.0
+                    idx_entry_overhead = 16.0
+                    idx_total += max(0.0, (avg_key_payload + idx_entry_overhead) * float(row_count))
+                index_bytes = int(idx_total)
+                total_relation_bytes = table_bytes + index_bytes
 
             table_rows.append(
                 {
@@ -927,6 +1090,24 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                     "total_bytes": total_relation_bytes,
                 }
             )
+
+    if dialect == "sqlite" and not sqlite_dbstat_map and sqlite_used_bytes is not None and table_rows:
+        total_weight = sum(max(int(item.get("row_count") or 0), 1) for item in table_rows)
+        if total_weight > 0:
+            allocated = 0
+            for idx, item in enumerate(table_rows):
+                weight = max(int(item.get("row_count") or 0), 1)
+                if idx == len(table_rows) - 1:
+                    est_total = max(0, int(sqlite_used_bytes) - allocated)
+                else:
+                    est_total = max(0, int(sqlite_used_bytes * weight / total_weight))
+                    allocated += est_total
+                item["table_bytes"] = est_total
+                item["index_bytes"] = 0
+                item["total_bytes"] = est_total
+            warnings.append("sqlite dbstat unavailable; table/index sizes are estimated by row count")
+    if (backend_name == "cloudflare" or dialect == "cloudflare_d1") and table_rows:
+        warnings.append("cloudflare d1 table/index sizes are estimated from row payload and index key width")
 
     table_rows.sort(
         key=lambda item: (
@@ -960,8 +1141,290 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
     }
 
 
+def repair_orphan_market_data_batch(
+    limit: int = 2000,
+    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    backend = _require_sqlalchemy_backend()
+    engine = backend._engine
+    dialect = str(engine.dialect.name or "").lower()
+    batch_size = max(1, int(limit or 2000))
+
+    with backend.session() as session:
+        inspector = sa.inspect(engine)
+        c2c_columns = {str(col.get("name") or "") for col in inspector.get_columns("c2c_items")}
+        has_detail_json = "detail_json" in c2c_columns
+        orphan_total_before_batch = int(
+            session.execute(
+                select(func.count(C2CItem.c2c_items_id)).where(
+                    ~select(C2CItemSnapshot.id)
+                    .join(Product, Product.id == C2CItemSnapshot.product_id)
+                    .where(C2CItemSnapshot.c2c_items_id == C2CItem.c2c_items_id)
+                    .exists()
+                )
+            ).scalar()
+            or 0
+        )
+        candidate_rows = session.scalars(
+            select(C2CItem)
+            .where(
+                ~select(C2CItemSnapshot.id)
+                .join(Product, Product.id == C2CItemSnapshot.product_id)
+                .where(C2CItemSnapshot.c2c_items_id == C2CItem.c2c_items_id)
+                .exists()
+            )
+            .order_by(
+                func.coalesce(C2CItem.created_at, C2CItem.updated_at).desc(),
+                C2CItem.c2c_items_id.desc(),
+            )
+            .limit(batch_size)
+        ).all()
+
+        total_items = len(candidate_rows)
+        created_product_count = 0
+        created_snapshot_count = 0
+        success_count = 0
+        skipped_count = 0
+        skipped_empty_detail = 0
+        skipped_without_items_id = 0
+        error_count = 0
+        fallback_detail_json_used = 0
+        error_samples: List[Dict[str, Any]] = []
+        max_error_samples = 50
+
+        def _add_error(c2c_items_id: int, reason: str) -> None:
+            nonlocal error_count
+            error_count += 1
+            if len(error_samples) < max_error_samples:
+                error_samples.append({"c2c_items_id": int(c2c_items_id), "reason": str(reason)})
+
+        if progress_cb:
+            progress_cb(
+                {
+                    "processed_items": 0,
+                    "total_items": total_items,
+                    "success_count": 0,
+                    "skipped_count": 0,
+                    "created_products": 0,
+                    "created_snapshots": 0,
+                }
+            )
+
+        for idx, row in enumerate(candidate_rows, start=1):
+            try:
+                detail_list, parse_reason = _decode_detail_blob_with_reason(row.detail_blob)
+                if not detail_list and has_detail_json:
+                    detail_json_value = session.execute(
+                        sa.text("SELECT detail_json FROM c2c_items WHERE c2c_items_id = :cid"),
+                        {"cid": int(row.c2c_items_id)},
+                    ).scalar()
+                    detail_list = _decode_detail_json_text(detail_json_value)
+                    if detail_list:
+                        fallback_detail_json_used += 1
+                if not detail_list:
+                    skipped_count += 1
+                    skipped_empty_detail += 1
+                    _add_error(
+                        int(row.c2c_items_id),
+                        f"empty_or_unparseable_detail_blob:{parse_reason or 'unknown'}",
+                    )
+                    if progress_cb:
+                        progress_cb(
+                            {
+                                "processed_items": idx,
+                                "total_items": total_items,
+                                "success_count": success_count,
+                                "skipped_count": skipped_count,
+                                "created_products": created_product_count,
+                                "created_snapshots": created_snapshot_count,
+                            }
+                        )
+                    continue
+                ts = str(row.created_at or row.updated_at or _now())
+                total_market = 0
+                for d_item in detail_list:
+                    try:
+                        total_market += int(d_item.get("marketPrice") or 0)
+                    except Exception:
+                        continue
+
+                had_linked_product = False
+                row_valid_detail_count = 0
+                for d_item in detail_list:
+                    items_id = (
+                        d_item.get("itemsId")
+                        if isinstance(d_item, dict)
+                        else None
+                    )
+                    if items_id is None and isinstance(d_item, dict):
+                        items_id = d_item.get("items_id")
+                    if items_id is None and isinstance(d_item, dict):
+                        items_id = d_item.get("itemId")
+                    if items_id is None:
+                        continue
+                    try:
+                        parsed_items_id = int(items_id)
+                    except Exception:
+                        continue
+                    row_valid_detail_count += 1
+
+                    try:
+                        parsed_blindbox_id = int(d_item.get("blindBoxId")) if d_item.get("blindBoxId") is not None else 0
+                    except Exception:
+                        parsed_blindbox_id = 0
+                    try:
+                        parsed_sku_id = int(d_item.get("skuId")) if d_item.get("skuId") is not None else 0
+                    except Exception:
+                        parsed_sku_id = 0
+                    try:
+                        parsed_market_price = int(d_item.get("marketPrice") or 0)
+                    except Exception:
+                        parsed_market_price = 0
+
+                    product = session.scalar(
+                        select(Product).where(
+                            Product.blindbox_id == parsed_blindbox_id,
+                            Product.items_id == parsed_items_id,
+                            Product.sku_id == parsed_sku_id,
+                        )
+                    )
+                    if product is None:
+                        product = Product(
+                            blindbox_id=parsed_blindbox_id,
+                            items_id=parsed_items_id,
+                            sku_id=parsed_sku_id,
+                            created_at=ts,
+                            updated_at=ts,
+                        )
+                        session.add(product)
+                        session.flush()
+                        created_product_count += 1
+                    product.name = d_item.get("name", product.name)
+                    product.img_url = d_item.get("img") or d_item.get("imgUrl") or d_item.get("image") or product.img_url
+                    product.market_price = parsed_market_price
+                    product.updated_at = ts
+
+                    est_price: Optional[int] = None
+                    if row.price is not None and total_market > 0:
+                        try:
+                            est_price = int(float(row.price) * float(parsed_market_price) / float(total_market))
+                        except Exception:
+                            est_price = None
+
+                    existing_snapshot = session.scalar(
+                        select(C2CItemSnapshot.id).where(
+                            C2CItemSnapshot.c2c_items_id == int(row.c2c_items_id),
+                            C2CItemSnapshot.product_id == int(product.id),
+                            C2CItemSnapshot.snapshot_at == ts,
+                        )
+                    )
+                    if existing_snapshot is None:
+                        session.add(
+                            C2CItemSnapshot(
+                                c2c_items_id=int(row.c2c_items_id),
+                                snapshot_at=ts,
+                                product_id=int(product.id),
+                                est_price=est_price,
+                            )
+                        )
+                        created_snapshot_count += 1
+                    had_linked_product = True
+
+                if had_linked_product:
+                    session.execute(
+                        sa.text(
+                            """
+                            DELETE FROM c2c_items_snapshot
+                            WHERE c2c_items_id = :c2c_items_id
+                              AND product_id NOT IN (SELECT id FROM product)
+                            """
+                        ),
+                        {"c2c_items_id": int(row.c2c_items_id)},
+                    )
+                    success_count += 1
+                else:
+                    skipped_count += 1
+                    if row_valid_detail_count == 0:
+                        skipped_without_items_id += 1
+                        _add_error(int(row.c2c_items_id), "detail_items_missing_items_id")
+                    else:
+                        _add_error(int(row.c2c_items_id), "detail_present_but_no_link_created")
+            except Exception as exc:
+                skipped_count += 1
+                _add_error(int(row.c2c_items_id), f"exception:{exc.__class__.__name__}:{exc}")
+
+            if progress_cb:
+                progress_cb(
+                    {
+                        "processed_items": idx,
+                        "total_items": total_items,
+                        "success_count": success_count,
+                        "skipped_count": skipped_count,
+                        "created_products": created_product_count,
+                        "created_snapshots": created_snapshot_count,
+                    }
+                )
+
+        remaining_orphan_items = int(
+            session.execute(
+                sa.text(
+                    """
+                    SELECT COUNT(*)
+                    FROM c2c_items i
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM c2c_items_snapshot s
+                        JOIN product p ON p.id = s.product_id
+                        WHERE s.c2c_items_id = i.c2c_items_id
+                    )
+                    """
+                )
+            ).scalar()
+            or 0
+        )
+        remaining_orphan_snapshots = int(
+            session.execute(
+                sa.text(
+                    """
+                    SELECT COUNT(*)
+                    FROM c2c_items_snapshot s
+                    LEFT JOIN product p ON p.id = s.product_id
+                    WHERE p.id IS NULL
+                    """
+                )
+            ).scalar()
+            or 0
+        )
+
+    return {
+        "ok": True,
+        "dialect": dialect,
+        "batch_size": batch_size,
+        "orphan_total_before_batch": orphan_total_before_batch,
+        "scanned_orphan_items": total_items,
+        "scanned_items": total_items,
+        "success_count": success_count,
+        "skipped_count": skipped_count,
+        "created_products": created_product_count,
+        "created_snapshots": created_snapshot_count,
+        "skipped_empty_detail": skipped_empty_detail,
+        "skipped_without_items_id": skipped_without_items_id,
+        "fallback_detail_json_used": fallback_detail_json_used,
+        "error_count": error_count,
+        "error_samples": error_samples,
+        "remaining_orphan_items": remaining_orphan_items,
+        "remaining_orphan_snapshots": remaining_orphan_snapshots,
+    }
+
+
+def prune_orphan_old_market_data() -> Dict[str, Any]:
+    return repair_orphan_market_data_batch(limit=2000)
+
+
 def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
     backend = _require_sqlalchemy_backend()
+    backend_name = get_db_backend_name()
+    is_cloudflare = backend_name == "cloudflare"
     ids = [int(it["c2cItemsId"]) for it in items if it.get("c2cItemsId") is not None]
     inserted = 0
     saved = 0
@@ -975,6 +1438,7 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
             existing_rows = {int(row.c2c_items_id): row for row in rows}
 
         snapshot_models: List[C2CItemSnapshot] = []
+        pending_detail_blob_updates: List[Tuple[int, str]] = []
 
         for it in items:
             item_id = it.get("c2cItemsId")
@@ -1013,9 +1477,17 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                 if not isinstance(detail_list, list):
                     detail_list = []
                 if "detailDtoList" in it:
-                    row.detail_blob = _encode_detail_blob(detail_list)
+                    encoded_blob = _encode_detail_blob(detail_list)
+                    if is_cloudflare:
+                        pending_detail_blob_updates.append((item_id, encoded_blob.hex()))
+                    else:
+                        row.detail_blob = encoded_blob
                 elif is_new:
-                    row.detail_blob = _encode_detail_blob([])
+                    encoded_blob = _encode_detail_blob([])
+                    if is_cloudflare:
+                        pending_detail_blob_updates.append((item_id, encoded_blob.hex()))
+                    else:
+                        row.detail_blob = encoded_blob
                 row.updated_at = timestamp
                 if is_new:
                     row.created_at = timestamp
@@ -1105,6 +1577,21 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
 
         if snapshot_models:
             session.add_all(snapshot_models)
+
+        if is_cloudflare and pending_detail_blob_updates:
+            # D1 JSON transport may coerce bytes params to TEXT; use SQL BLOB literal.
+            session.flush()
+            for blob_item_id, blob_hex in pending_detail_blob_updates:
+                session.execute(
+                    sa.text(
+                        f"""
+                        UPDATE c2c_items
+                        SET detail_blob = X'{blob_hex}'
+                        WHERE c2c_items_id = :c2c_items_id
+                        """
+                    ),
+                    {"c2c_items_id": int(blob_item_id)},
+                )
 
     return saved, inserted
 
@@ -1842,8 +2329,10 @@ def upsert_access_user(
             row = AccessUser(username=username)
             session.add(row)
         row.display_name = str(display_name or "").strip()
-        row.password_hash = str(password_hash or "")
-        row.telegram_id = None
+        next_password = str(password_hash or "")
+        if next_password and not is_password_hash(next_password):
+            next_password = hash_password(next_password)
+        row.password_hash = next_password
         row.telegram_ids_json = json.dumps(telegram_id_list, ensure_ascii=False)
         row.keywords_json = json.dumps(keyword_list, ensure_ascii=False)
         row.roles_json = json.dumps(role_list, ensure_ascii=False)
