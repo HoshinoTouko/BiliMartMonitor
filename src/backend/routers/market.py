@@ -5,7 +5,7 @@ Routes:
   GET /api/market/items?page=1&limit=20
   GET /api/market/items/search?q=洛琪希&page=1&limit=20
   GET /api/market/items/{id}
-  GET /api/market/items/{id}/price-history
+  GET /api/product/{items_id}/{sku_id}/price-history
 """
 from __future__ import annotations
 
@@ -23,11 +23,10 @@ if _SRC_ROOT not in sys.path:
 from backend.auth import get_current_user  # noqa: E402
 from bsm.db import (  # noqa: E402
     get_market_item,
-    get_market_item_price_history,
     get_market_item_recent_15d_listings,
     get_primary_items_id,
-    get_product_metadata,
     get_product_price_history,
+    get_product_metadata,
     get_recent_15d_listings,
     list_market_items,
     search_market_items,
@@ -93,10 +92,10 @@ def api_search_market_items(
     )
 
 
-@router.get("/api/market/items/{item_id}/price-history")
-def api_item_price_history(item_id: int) -> JSONResponse:
-    items_id, history = get_market_item_price_history(item_id)
-    return JSONResponse({"item_id": item_id, "items_id": items_id, "history": history})
+@router.get("/api/product/{items_id}/{sku_id}/price-history")
+def api_product_price_history(items_id: int, sku_id: int) -> JSONResponse:
+    history = get_product_price_history(items_id, sku_id=sku_id)
+    return JSONResponse({"items_id": items_id, "sku_id": sku_id, "history": history})
 
 
 @router.get("/api/market/items/{item_id}/recent-listings")
@@ -143,12 +142,6 @@ def api_get_product_metadata(items_id: int) -> JSONResponse:
     if metadata is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({"product": metadata})
-
-
-@router.get("/api/market/product/{items_id}/price-history")
-def api_product_price_history(items_id: int) -> JSONResponse:
-    history = get_product_price_history(items_id)
-    return JSONResponse({"items_id": items_id, "history": history})
 
 
 @router.get("/api/market/product/{items_id}/recent-listings")

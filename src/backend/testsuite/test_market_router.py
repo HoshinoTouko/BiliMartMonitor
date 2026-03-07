@@ -73,7 +73,14 @@ class MarketRouterTestCase(unittest.TestCase):
                 "isMyPublish": False,
                 "uface": "https://example.com/face.jpg",
                 "uname": "alice",
-                "detailDtoList": [{"itemsId": 50, "name": "Test Bundled Item", "img": "https://example.com/item.png"}],
+                "detailDtoList": [
+                    {
+                        "itemsId": 50,
+                        "skuId": 5001,
+                        "name": "Test Bundled Item",
+                        "img": "https://example.com/item.png",
+                    }
+                ],
             },
             {
                 "c2cItemsId": 3002,
@@ -217,12 +224,12 @@ class MarketRouterTestCase(unittest.TestCase):
         self.assertIn("error", body)
 
     # ------------------------------------------------------------------
-    # GET /api/market/items/{id}/price-history
+    # GET /api/product/{items_id}/{sku_id}/price-history
     # ------------------------------------------------------------------
 
     def test_price_history_empty(self) -> None:
         self.save_items([self.sample_items[0]])
-        resp = self.client.get("/api/market/items/3001/price-history", auth=self.auth)
+        resp = self.client.get("/api/product/50/5001/price-history", auth=self.auth)
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertIn("history", body)
@@ -235,16 +242,50 @@ class MarketRouterTestCase(unittest.TestCase):
         updated["showPrice"] = "95.00"
         self.save_items([updated])
 
-        resp = self.client.get("/api/market/items/3001/price-history", auth=self.auth)
+        resp = self.client.get("/api/product/50/5001/price-history", auth=self.auth)
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(len(body["history"]), 2)
 
     def test_price_history_unknown_item(self) -> None:
-        resp = self.client.get("/api/market/items/9999/price-history", auth=self.auth)
+        resp = self.client.get("/api/product/9999/9999/price-history", auth=self.auth)
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["history"], [])
+
+    def test_legacy_price_history_routes_removed(self) -> None:
+        resp_item = self.client.get("/api/market/items/3001/price-history", auth=self.auth)
+        self.assertEqual(resp_item.status_code, 404)
+        resp_product = self.client.get("/api/market/product/50/price-history", auth=self.auth)
+        self.assertEqual(resp_product.status_code, 404)
+
+    def test_price_history_is_scoped_by_sku_id(self) -> None:
+        self.save_items(
+            [
+                {
+                    "c2cItemsId": 3101,
+                    "c2cItemsName": "SKU A",
+                    "price": 10000,
+                    "showPrice": "100.00",
+                    "detailDtoList": [{"itemsId": 90, "skuId": 9001, "name": "Same Item", "marketPrice": 100}],
+                },
+                {
+                    "c2cItemsId": 3102,
+                    "c2cItemsName": "SKU B",
+                    "price": 20000,
+                    "showPrice": "200.00",
+                    "detailDtoList": [{"itemsId": 90, "skuId": 9002, "name": "Same Item", "marketPrice": 100}],
+                },
+            ]
+        )
+
+        resp = self.client.get("/api/product/90/9001/price-history", auth=self.auth)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["items_id"], 90)
+        self.assertEqual(body["sku_id"], 9001)
+        self.assertEqual(len(body["history"]), 1)
+        self.assertEqual(body["history"][0]["c2c_items_id"], 3101)
 
     # ------------------------------------------------------------------
     # Route resolution — /search must not be captured by /{id}
@@ -295,19 +336,30 @@ class MarketRouterTestCase(unittest.TestCase):
         body = resp.json()
         self.assertIn("product", body)
         self.assertEqual(body["product"]["items_id"], 50)
+        self.assertEqual(body["product"]["sku_id"], 5001)
         self.assertEqual(body["product"]["name"], "Test Bundled Item")
 
     def test_get_product_metadata_not_found(self) -> None:
         resp = self.client.get("/api/market/product/99999", auth=self.auth)
         self.assertEqual(resp.status_code, 404)
 
-    def test_product_price_history(self) -> None:
-        self.save_items(self.sample_items)
-        resp = self.client.get("/api/market/product/50/price-history", auth=self.auth)
+    def test_get_product_metadata_without_sku_returns_null_sku_id(self) -> None:
+        self.save_items(
+            [
+                {
+                    "c2cItemsId": 3201,
+                    "c2cItemsName": "No SKU Payload",
+                    "price": 10000,
+                    "showPrice": "100.00",
+                    "detailDtoList": [{"itemsId": 91, "name": "No SKU Item", "marketPrice": 100}],
+                }
+            ]
+        )
+        resp = self.client.get("/api/market/product/91", auth=self.auth)
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertEqual(body["items_id"], 50)
-        self.assertIsInstance(body["history"], list)
+        self.assertIn("product", body)
+        self.assertIsNone(body["product"]["sku_id"])
 
     def test_product_recent_listings(self) -> None:
         self.save_items(self.sample_items)

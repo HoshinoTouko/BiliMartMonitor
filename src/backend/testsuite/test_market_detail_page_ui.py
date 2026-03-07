@@ -28,6 +28,14 @@ class MarketDetailPageUiTestCase(unittest.TestCase):
         self.assertIn('<Link href="/market" className="bsm-link" style={{ fontSize: "0.875rem" }}>', content)
         self.assertNotIn('<Link href="/market" className="bsm-link" style={{ fontSize: "0.875rem" }} prefetch={false}>', content)
 
+    def test_market_detail_page_shows_blindbox_item_sku_in_one_line(self) -> None:
+        content = read_text("src/frontend/src/app/market/[id]/page.tsx")
+
+        self.assertIn("盲盒ID：", content)
+        self.assertIn("Item ID：", content)
+        self.assertIn("SKU ID：", content)
+        self.assertIn('{" | "}', content)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,49 @@
 # Work Log
 
+## 2026-03-07 Product Triple + Snapshot + BLOB Compression Migration
+
+### Planned
+
+- Introduce normalized product storage using triple key `(blindbox_id, items_id, sku_id)`.
+- Introduce snapshot table for listing component timelines and proportional estimated prices.
+- Add blob-compressed raw detail storage on `c2c_items`.
+- Migrate old data from `detail_json` / `c2c_items_details` into new schema.
+
+### Step Log
+
+1. Added migration document `doc/C2C_PRODUCT_SNAPSHOT_BLOB_MIGRATION.md` covering rollout phases, safety checks, and rollback strategy.
+2. Added new DB models in `src/bsm/orm_models.py`:
+   - `product` (triple-key primary table),
+   - `c2c_items_snapshot` (snapshot timeline table),
+   - plus `c2c_items.detail_blob` / `detail_codec`.
+3. Added alembic migration `e1a5c9d2b741_add_product_snapshot_and_blob_columns.py` to create new tables and new columns.
+4. Updated runtime DB compatibility bootstrap in `src/bsm/db.py` to auto-add `detail_blob`/`detail_codec` on existing deployments.
+5. Refactored detail parsing in `src/bsm/db.py`:
+   - blob-first decode (`gzip`) with JSON fallback,
+   - shared bundled-item parser for market item/read paths.
+6. Updated `save_items` write path to dual-write:
+   - writes compressed blob,
+   - upserts `product` for full triple rows,
+   - writes `c2c_items_snapshot` rows with proportional `est_price`,
+   - keeps legacy `c2c_items_details` writes for transition period.
+7. Updated `src/backend/backfill_details.py` to read details from blob first.
+8. Added backfill executor `src/bsm-cli/migrate_product_snapshot.py`:
+   - optional `--reset`,
+   - backfills `detail_blob`,
+   - migrates data to `product` and `c2c_items_snapshot`,
+   - preserves legacy timeline from `c2c_items_details` with nullable triple fields.
+9. Executed migration script locally (`--reset`) on current scan DB and verified row counts.
+
+### Verification
+
+- `python3 -m compileall src/bsm/db.py src/bsm/orm_models.py src/backend/backfill_details.py src/bsm-cli/migrate_product_snapshot.py alembic/versions/e1a5c9d2b741_add_product_snapshot_and_blob_columns.py`
+- `python3 src/bsm-cli/migrate_product_snapshot.py --reset`
+- Post-check counts:
+  - `product`: `2392`
+  - `c2c_items_snapshot`: `5274`
+  - `c2c_items_details`: `2770` (legacy retained)
+  - `c2c_items` rows with blob: `2188`
+
 ## 2026-03-06 Monitor Uptime Logs, Market Sorting Semantics, and Frontend API Retry
 
 ### Planned

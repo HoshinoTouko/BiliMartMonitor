@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import re
@@ -22,7 +23,8 @@ from .orm_models import (
     Base,
     BiliSession,
     C2CItem,
-    C2CItemDetail,
+    C2CItemSnapshot,
+    Product,
 )
 
 
@@ -238,22 +240,8 @@ class SqlalchemyBackend(DatabaseBackend):
             item_columns = {column["name"] for column in inspector.get_columns("c2c_items")}
             if "category_id" not in item_columns:
                 conn.execute(sa.text("ALTER TABLE c2c_items ADD COLUMN category_id TEXT"))
-            detail_columns = {column["name"] for column in inspector.get_columns("c2c_items_details")}
-            if "snapshot_at" not in detail_columns:
-                conn.execute(sa.text("ALTER TABLE c2c_items_details ADD COLUMN snapshot_at TEXT"))
-            conn.execute(
-                sa.text(
-                    """
-                    UPDATE c2c_items_details
-                    SET snapshot_at = COALESCE(
-                        snapshot_at,
-                        (SELECT COALESCE(c2c_items.updated_at, c2c_items.created_at) FROM c2c_items WHERE c2c_items.c2c_items_id = c2c_items_details.c2c_items_id),
-                        CURRENT_TIMESTAMP
-                    )
-                    WHERE snapshot_at IS NULL OR TRIM(snapshot_at) = ''
-                    """
-                )
-            )
+            if "detail_blob" not in item_columns:
+                conn.execute(sa.text("ALTER TABLE c2c_items ADD COLUMN detail_blob BLOB"))
 
     def _is_sqlite(self) -> bool:
         return self.db_url.startswith("sqlite:///")
@@ -393,16 +381,45 @@ def _access_user_to_dict(row: AccessUser) -> Dict[str, Any]:
     }
 
 
+def _encode_detail_blob(detail_list: List[Dict[str, Any]]) -> bytes:
+    raw = json.dumps(detail_list, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return gzip.compress(raw, compresslevel=6)
+
+
+def _decode_detail_blob(detail_blob: Any) -> List[Dict[str, Any]]:
+    if not detail_blob:
+        return []
+    try:
+        blob_bytes = bytes(detail_blob)
+    except Exception:
+        return []
+    try:
+        return json.loads(gzip.decompress(blob_bytes).decode("utf-8"))
+    except Exception:
+        return []
+
+
+def _extract_img_from_detail_items(data: Any) -> str:
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, dict):
+            for key in ("img", "imgUrl", "image"):
+                val = first.get(key)
+                if val and isinstance(val, str) and val.strip():
+                    return val.strip()
+    return ""
+
+
+def _parse_bundled_items_from_row(row: Any) -> List[Dict[str, Any]]:
+    bundled_items = _decode_detail_blob(getattr(row, "detail_blob", None))
+    return bundled_items if bundled_items else []
+
+
 def _market_item_to_dict(
     row: C2CItem,
     recent_listed_count: int = 0,
 ) -> Dict[str, Any]:
-    bundled_items = []
-    if row.detail_json:
-        try:
-            bundled_items = json.loads(row.detail_json)
-        except Exception:
-            pass
+    bundled_items = _parse_bundled_items_from_row(row)
     return {
         "id": row.c2c_items_id,
         "category_id": row.category_id,
@@ -411,7 +428,7 @@ def _market_item_to_dict(
         "show_market_price": row.show_market_price,
         "uface": row.uface,
         "uname": row.uname,
-        "img_url": _extract_img_from_detail_json(row.detail_json),
+        "img_url": _extract_img_from_detail_items(bundled_items),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         "recent_listed_count": recent_listed_count,
@@ -422,34 +439,37 @@ def _market_item_to_dict(
     }
 
 
-def _latest_detail_snapshot_subquery(name: str = "latest_detail_snapshot"):
+def _latest_snapshot_subquery(name: str = "latest_snapshot"):
     return (
         select(
-            C2CItemDetail.c2c_items_id.label("c2c_items_id"),
-            func.max(C2CItemDetail.snapshot_at).label("snapshot_at"),
+            C2CItemSnapshot.c2c_items_id.label("c2c_items_id"),
+            func.max(C2CItemSnapshot.snapshot_at).label("snapshot_at"),
         )
-        .group_by(C2CItemDetail.c2c_items_id)
+        .group_by(C2CItemSnapshot.c2c_items_id)
         .subquery(name)
     )
 
 
 def _current_item_details_subquery(name: str = "current_item_details"):
-    latest_snapshot = _latest_detail_snapshot_subquery(f"{name}_latest")
+    latest_snapshot = _latest_snapshot_subquery(f"{name}_latest")
     return (
         select(
-            C2CItemDetail.id.label("id"),
-            C2CItemDetail.c2c_items_id.label("c2c_items_id"),
-            C2CItemDetail.items_id.label("items_id"),
-            C2CItemDetail.name.label("name"),
-            C2CItemDetail.img_url.label("img_url"),
-            C2CItemDetail.market_price.label("market_price"),
-            C2CItemDetail.snapshot_at.label("snapshot_at"),
+            C2CItemSnapshot.id.label("id"),
+            C2CItemSnapshot.c2c_items_id.label("c2c_items_id"),
+            Product.items_id.label("items_id"),
+            Product.sku_id.label("sku_id"),
+            Product.name.label("name"),
+            Product.img_url.label("img_url"),
+            Product.market_price.label("market_price"),
+            C2CItemSnapshot.est_price.label("est_price"),
+            C2CItemSnapshot.snapshot_at.label("snapshot_at"),
         )
+        .join(Product, Product.id == C2CItemSnapshot.product_id)
         .join(
             latest_snapshot,
             and_(
-                C2CItemDetail.c2c_items_id == latest_snapshot.c.c2c_items_id,
-                C2CItemDetail.snapshot_at == latest_snapshot.c.snapshot_at,
+                C2CItemSnapshot.c2c_items_id == latest_snapshot.c.c2c_items_id,
+                C2CItemSnapshot.snapshot_at == latest_snapshot.c.snapshot_at,
             ),
         )
         .subquery(name)
@@ -466,11 +486,20 @@ def _market_recent_listing_count_expr(cutoff: Optional[str] = None):
         .correlate(C2CItem)
         .scalar_subquery()
     )
+    primary_sku_sq = (
+        select(current_details.c.sku_id)
+        .where(current_details.c.c2c_items_id == C2CItem.c2c_items_id)
+        .order_by(current_details.c.id.asc())
+        .limit(1)
+        .correlate(C2CItem)
+        .scalar_subquery()
+    )
     return (
         select(func.count(func.distinct(current_details.c.c2c_items_id)))
         .select_from(current_details)
         .join(recent_item, recent_item.c2c_items_id == current_details.c.c2c_items_id)
         .where(current_details.c.items_id == primary_items_sq)
+        .where(current_details.c.sku_id == primary_sku_sq)
         .where(recent_item.updated_at >= cutoff_value)
         .correlate(C2CItem)
         .scalar_subquery()
@@ -587,6 +616,7 @@ def _load_market_items_page(
 def _load_recent_15d_listings_page(
     *,
     items_id_expr,
+    sku_id_expr=None,
     page: int,
     limit: int,
     sort_by: str,
@@ -597,25 +627,11 @@ def _load_recent_15d_listings_page(
     offset = (page - 1) * limit
     cutoff = _utc_cutoff(days=15)
     items_id_sql = items_id_expr if hasattr(items_id_expr, "label") else literal(items_id_expr)
+    sku_id_sql = None
+    if sku_id_expr is not None:
+        sku_id_sql = sku_id_expr if hasattr(sku_id_expr, "label") else literal(sku_id_expr)
     current_details = _current_item_details_subquery("recent_listing_current_details")
-
-    matching_c2c_sq = (
-        select(current_details.c.c2c_items_id)
-        .where(current_details.c.items_id == items_id_sql)
-        .correlate(None)
-    )
-    total_market_sq = (
-        select(
-            current_details.c.c2c_items_id.label("c2c_items_id"),
-            func.sum(current_details.c.market_price).label("total_market"),
-        )
-        .where(current_details.c.c2c_items_id.in_(matching_c2c_sq))
-        .group_by(current_details.c.c2c_items_id)
-        .subquery()
-    )
-    denom = case((total_market_sq.c.total_market > 0, total_market_sq.c.total_market), else_=1)
-
-    grouped_rows = (
+    grouped_stmt = (
         select(
             C2CItem.c2c_items_id.label("c2c_items_id"),
             C2CItem.c2c_items_name.label("name"),
@@ -625,32 +641,32 @@ def _load_recent_15d_listings_page(
             C2CItem.uname.label("uname"),
             C2CItem.created_at.label("created_at"),
             C2CItem.updated_at.label("updated_at"),
-            C2CItem.detail_json.label("detail_json"),
+            C2CItem.detail_blob.label("detail_blob"),
             C2CItem.publish_status.label("publish_status"),
             C2CItem.sale_status.label("sale_status"),
             C2CItem.drop_reason.label("drop_reason"),
-            func.min(C2CItem.price * 1.0 * current_details.c.market_price / denom).label("est_price"),
+            func.min(current_details.c.est_price).label("est_price"),
         )
         .join(current_details, current_details.c.c2c_items_id == C2CItem.c2c_items_id)
-        .join(total_market_sq, current_details.c.c2c_items_id == total_market_sq.c.c2c_items_id)
         .where(current_details.c.items_id == items_id_sql)
         .where(C2CItem.updated_at >= cutoff)
-        .group_by(
-            C2CItem.c2c_items_id,
-            C2CItem.c2c_items_name,
-            C2CItem.show_price,
-            C2CItem.show_market_price,
-            C2CItem.uface,
-            C2CItem.uname,
-            C2CItem.created_at,
-            C2CItem.updated_at,
-            C2CItem.detail_json,
-            C2CItem.publish_status,
-            C2CItem.sale_status,
-            C2CItem.drop_reason,
-        )
-        .subquery()
     )
+    if sku_id_sql is not None:
+        grouped_stmt = grouped_stmt.where(current_details.c.sku_id == sku_id_sql)
+    grouped_rows = grouped_stmt.group_by(
+        C2CItem.c2c_items_id,
+        C2CItem.c2c_items_name,
+        C2CItem.show_price,
+        C2CItem.show_market_price,
+        C2CItem.uface,
+        C2CItem.uname,
+        C2CItem.created_at,
+        C2CItem.updated_at,
+        C2CItem.detail_blob,
+        C2CItem.publish_status,
+        C2CItem.sale_status,
+        C2CItem.drop_reason,
+    ).subquery()
     order_clauses = _recent_listing_page_order_clauses(grouped_rows, sort_by)
     numbered_rows = (
         select(
@@ -684,7 +700,7 @@ def _load_recent_15d_listings_page(
                 paged_rows.c.uname,
                 paged_rows.c.created_at,
                 paged_rows.c.updated_at,
-                paged_rows.c.detail_json,
+                paged_rows.c.detail_blob,
                 paged_rows.c.publish_status,
                 paged_rows.c.sale_status,
                 paged_rows.c.drop_reason,
@@ -704,12 +720,7 @@ def _load_recent_15d_listings_page(
     for row in rows:
         if row.c2c_items_id is None:
             continue
-        bundled_items = []
-        if row.detail_json:
-            try:
-                bundled_items = json.loads(row.detail_json)
-            except Exception:
-                pass
+        bundled_items = _parse_bundled_items_from_row(row)
         est_price = row.est_price
         listings.append(
             {
@@ -816,7 +827,7 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                 warnings.append(f"skip table {table_name}: {exc.__class__.__name__}")
                 continue
             recent_rows: Optional[int] = None
-            if table_name == "c2c_items_details":
+            if table_name == "c2c_items_snapshot":
                 try:
                     if dialect == "sqlite":
                         recent_rows = int(
@@ -824,8 +835,8 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                                 sa.text(
                                     """
                                     SELECT COUNT(*)
-                                    FROM c2c_items_details d
-                                    JOIN c2c_items i ON i.c2c_items_id = d.c2c_items_id
+                                    FROM c2c_items_snapshot s
+                                    JOIN c2c_items i ON i.c2c_items_id = s.c2c_items_id
                                     WHERE datetime(COALESCE(i.updated_at, i.created_at)) >= datetime(:cutoff)
                                     """
                                 ),
@@ -839,8 +850,8 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                                 sa.text(
                                     """
                                     SELECT COUNT(*)
-                                    FROM c2c_items_details d
-                                    JOIN c2c_items i ON i.c2c_items_id = d.c2c_items_id
+                                    FROM c2c_items_snapshot s
+                                    JOIN c2c_items i ON i.c2c_items_id = s.c2c_items_id
                                     WHERE COALESCE(i.updated_at, i.created_at) >= :cutoff
                                     """
                                 ),
@@ -963,7 +974,7 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
             ).all()
             existing_rows = {int(row.c2c_items_id): row for row in rows}
 
-        detail_models: List[C2CItemDetail] = []
+        snapshot_models: List[C2CItemSnapshot] = []
 
         for it in items:
             item_id = it.get("c2cItemsId")
@@ -998,27 +1009,91 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                 row.publish_status = it.get("publishStatus")
                 row.sale_status = it.get("saleStatus")
                 row.drop_reason = _sanitize_str(it.get("dropReason"))
+                detail_list = it.get("detailDtoList", [])
+                if not isinstance(detail_list, list):
+                    detail_list = []
                 if "detailDtoList" in it:
-                    row.detail_json = json.dumps(it.get("detailDtoList", []), ensure_ascii=False)
+                    row.detail_blob = _encode_detail_blob(detail_list)
                 elif is_new:
-                    row.detail_json = "[]"
+                    row.detail_blob = _encode_detail_blob([])
                 row.updated_at = timestamp
                 if is_new:
                     row.created_at = timestamp
 
                 details_snapshot_at = _snapshot_now()
-                for d_item in it.get("detailDtoList", []):
+                total_market_price = 0
+                for d_item in detail_list:
+                    try:
+                        total_market_price += int(d_item.get("marketPrice", 0) or 0)
+                    except Exception:
+                        continue
+
+                for d_item in detail_list:
                     d_items_id = d_item.get("itemsId")
                     if not d_items_id:
                         continue
-                    detail_models.append(
-                        C2CItemDetail(
+                    try:
+                        parsed_items_id = int(d_items_id)
+                    except Exception:
+                        continue
+                    market_price = d_item.get("marketPrice", 0)
+                    try:
+                        parsed_market_price = int(market_price or 0)
+                    except Exception:
+                        parsed_market_price = 0
+                    parsed_blindbox_id: Optional[int] = None
+                    parsed_sku_id: Optional[int] = None
+                    try:
+                        raw_blindbox = d_item.get("blindBoxId")
+                        if raw_blindbox is not None:
+                            parsed_blindbox_id = int(raw_blindbox)
+                    except Exception:
+                        parsed_blindbox_id = None
+                    try:
+                        raw_sku = d_item.get("skuId")
+                        if raw_sku is not None:
+                            parsed_sku_id = int(raw_sku)
+                    except Exception:
+                        parsed_sku_id = None
+
+                    est_price: Optional[int] = None
+                    if new_price is not None and total_market_price > 0:
+                        try:
+                            est_price = int(float(new_price) * float(parsed_market_price) / float(total_market_price))
+                        except Exception:
+                            est_price = None
+                    # Legacy payloads may not carry blindBoxId/skuId; use 0 placeholders
+                    # to keep snapshot->product linkage complete during migration.
+                    if parsed_blindbox_id is None:
+                        parsed_blindbox_id = 0
+                    if parsed_sku_id is None:
+                        parsed_sku_id = 0
+                    existing_product = session.scalar(
+                        select(Product).where(
+                            Product.blindbox_id == parsed_blindbox_id,
+                            Product.items_id == parsed_items_id,
+                            Product.sku_id == parsed_sku_id,
+                        )
+                    )
+                    if existing_product is None:
+                        existing_product = Product(
+                            blindbox_id=parsed_blindbox_id,
+                            items_id=parsed_items_id,
+                            sku_id=parsed_sku_id,
+                            created_at=timestamp,
+                        )
+                        session.add(existing_product)
+                        session.flush()
+                    existing_product.name = d_item.get("name", existing_product.name)
+                    existing_product.img_url = _extract_img_from_detail_items([d_item])
+                    existing_product.market_price = parsed_market_price
+                    existing_product.updated_at = timestamp
+                    snapshot_models.append(
+                        C2CItemSnapshot(
                             c2c_items_id=item_id,
-                            items_id=int(d_items_id),
-                            name=d_item.get("name", ""),
-                            img_url=_extract_img_from_detail_json(json.dumps([d_item])),
-                            market_price=d_item.get("marketPrice", 0),
                             snapshot_at=details_snapshot_at,
+                            product_id=int(existing_product.id),
+                            est_price=est_price,
                         )
                     )
 
@@ -1028,8 +1103,8 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
             except Exception:
                 continue
 
-        if detail_models:
-            session.add_all(detail_models)
+        if snapshot_models:
+            session.add_all(snapshot_models)
 
     return saved, inserted
 
@@ -1165,24 +1240,6 @@ def search_items_by_pattern(pattern: str, limit: int = 50, page: int = 1) -> Tup
     return matched[start:end] if start < total_count else [], total_count, total_pages
 
 
-def _extract_img_from_detail_json(detail_json_str: Any) -> str:
-    """Return first image URL from detail_json, or empty string."""
-    if not detail_json_str:
-        return ""
-    try:
-        data = json.loads(str(detail_json_str))
-        if isinstance(data, list) and data:
-            first = data[0]
-            # Keys may vary across versions: img, imgUrl, image
-            for key in ("img", "imgUrl", "image"):
-                val = first.get(key)
-                if val and isinstance(val, str) and val.strip():
-                    return val.strip()
-    except Exception:
-        pass
-    return ""
-
-
 def list_market_items(
     page: int = 1,
     limit: int = 20,
@@ -1241,40 +1298,58 @@ def get_15d_listing_counts_batch(c2c_items_ids: List[int]) -> Dict[int, int]:
     cutoff = _utc_cutoff(days=15)
     current_details = _current_item_details_subquery("counts_current_details")
     with backend.session() as session:
-        rows_items = session.execute(
+        rows_items = (
             select(
                 current_details.c.c2c_items_id,
-                func.min(current_details.c.items_id),
+                current_details.c.items_id,
+                current_details.c.sku_id,
+                func.row_number()
+                .over(
+                    partition_by=current_details.c.c2c_items_id,
+                    order_by=current_details.c.id.asc(),
+                )
+                .label("row_num"),
             )
             .where(current_details.c.c2c_items_id.in_(c2c_items_ids))
-            .group_by(current_details.c.c2c_items_id)
+            .subquery()
+        )
+        primary_rows = session.execute(
+            select(rows_items.c.c2c_items_id, rows_items.c.items_id, rows_items.c.sku_id)
+            .where(rows_items.c.row_num == 1)
         ).all()
 
-        primary_items_map: Dict[int, int] = {}
-        items_ids_to_query = set()
-        for c2c_id, items_id in rows_items:
-            if items_id is None:
+        primary_key_map: Dict[int, Tuple[int, int]] = {}
+        keys_to_query: set[Tuple[int, int]] = set()
+        for c2c_id, items_id, sku_id in primary_rows:
+            if items_id is None or sku_id is None:
                 continue
-            primary_items_map[int(c2c_id)] = int(items_id)
-            items_ids_to_query.add(int(items_id))
+            key = (int(items_id), int(sku_id))
+            primary_key_map[int(c2c_id)] = key
+            keys_to_query.add(key)
 
-        if not items_ids_to_query:
+        if not keys_to_query:
             return {cid: 0 for cid in c2c_items_ids}
 
         rows_counts = session.execute(
             select(
                 current_details.c.items_id,
+                current_details.c.sku_id,
                 func.count(func.distinct(current_details.c.c2c_items_id)),
             )
             .join(C2CItem, current_details.c.c2c_items_id == C2CItem.c2c_items_id)
-            .where(current_details.c.items_id.in_(items_ids_to_query))
+            .where(
+                sa.tuple_(current_details.c.items_id, current_details.c.sku_id).in_(keys_to_query)
+            )
             .where(C2CItem.updated_at >= cutoff)
-            .group_by(current_details.c.items_id)
+            .group_by(current_details.c.items_id, current_details.c.sku_id)
         ).all()
 
-    counts_map = {int(items_id): int(count) for items_id, count in rows_counts}
+    counts_map = {
+        (int(items_id), int(sku_id)): int(count)
+        for items_id, sku_id, count in rows_counts
+    }
     return {
-        cid: counts_map.get(primary_items_map.get(cid, 0), 0)
+        cid: counts_map.get(primary_key_map.get(cid, (0, 0)), 0)
         for cid in c2c_items_ids
     }
 
@@ -1285,19 +1360,19 @@ def get_item_price_history(c2c_items_id: int) -> List[Dict[str, Any]]:
     with backend.session() as session:
         rows = session.execute(
             select(
-                C2CItemDetail.snapshot_at.label("recorded_at"),
+                C2CItemSnapshot.snapshot_at.label("recorded_at"),
                 C2CItem.price.label("price"),
                 C2CItem.show_price.label("show_price"),
             )
-            .join(C2CItem, C2CItem.c2c_items_id == C2CItemDetail.c2c_items_id)
-            .where(C2CItemDetail.c2c_items_id == c2c_items_id)
-            .where(C2CItemDetail.snapshot_at.is_not(None))
+            .join(C2CItem, C2CItem.c2c_items_id == C2CItemSnapshot.c2c_items_id)
+            .where(C2CItemSnapshot.c2c_items_id == c2c_items_id)
+            .where(C2CItemSnapshot.snapshot_at.is_not(None))
             .group_by(
-                C2CItemDetail.snapshot_at,
+                C2CItemSnapshot.snapshot_at,
                 C2CItem.price,
                 C2CItem.show_price,
             )
-            .order_by(C2CItemDetail.snapshot_at.asc())
+            .order_by(C2CItemSnapshot.snapshot_at.asc())
         ).all()
     if not rows:
         with backend.session() as session:
@@ -1333,26 +1408,26 @@ def get_item_price_history(c2c_items_id: int) -> List[Dict[str, Any]]:
     return history
 
 
-def get_market_item_price_history(c2c_items_id: int) -> Tuple[Optional[int], List[Dict[str, Any]]]:
-    """Return item history using detail snapshots; aggregate at product level if mapped."""
-    items_id = get_primary_items_id(c2c_items_id)
-    if items_id is None:
-        return None, get_item_price_history(c2c_items_id)
-    return items_id, get_product_price_history(items_id)
+def get_primary_product_key(c2c_items_id: int) -> Optional[Tuple[int, int]]:
+    """Get the first (items_id, sku_id) associated with a c2c_items_id."""
+    backend = _require_sqlalchemy_backend()
+    with backend.session() as session:
+        row = session.execute(
+            select(Product.items_id, Product.sku_id)
+            .join(C2CItemSnapshot, C2CItemSnapshot.product_id == Product.id)
+            .where(C2CItemSnapshot.c2c_items_id == c2c_items_id)
+            .order_by(C2CItemSnapshot.id.asc())
+            .limit(1)
+        ).first()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), int(row[1])
 
 
 def get_primary_items_id(c2c_items_id: int) -> Optional[int]:
     """Get the first official itemsId associated with a c2c_items_id."""
-    backend = _require_sqlalchemy_backend()
-    current_details = _current_item_details_subquery("primary_items_current_details")
-    with backend.session() as session:
-        item_id = session.scalar(
-            select(current_details.c.items_id)
-            .where(current_details.c.c2c_items_id == c2c_items_id)
-            .order_by(current_details.c.id.asc())
-            .limit(1)
-        )
-        return int(item_id) if item_id is not None else None
+    primary = get_primary_product_key(c2c_items_id)
+    return int(primary[0]) if primary is not None else None
 
 
 def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
@@ -1360,16 +1435,6 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
     backend = _require_sqlalchemy_backend()
     cutoff = _utc_cutoff(days=15)
     current_details = _current_item_details_subquery("product_metadata_current_details")
-    
-    total_market_sq = (
-        select(
-            current_details.c.c2c_items_id.label("c2c_items_id"),
-            func.sum(current_details.c.market_price).label("total_market"),
-        )
-        .group_by(current_details.c.c2c_items_id)
-        .subquery()
-    )
-    denom = case((total_market_sq.c.total_market > 0, total_market_sq.c.total_market), else_=1)
     
     name_sq = (
         select(current_details.c.name)
@@ -1383,14 +1448,22 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
         .limit(1)
         .scalar_subquery()
     )
+    sku_id_sq = (
+        select(current_details.c.sku_id)
+        .where(current_details.c.items_id == items_id)
+        .where(current_details.c.sku_id.is_not(None))
+        .where(current_details.c.sku_id > 0)
+        .order_by(current_details.c.id.asc())
+        .limit(1)
+        .scalar_subquery()
+    )
     stats_sq = (
         select(
-            func.min(C2CItem.price * 1.0 * current_details.c.market_price / denom).label("price_min"),
-            func.max(C2CItem.price * 1.0 * current_details.c.market_price / denom).label("price_max"),
+            func.min(current_details.c.est_price).label("price_min"),
+            func.max(current_details.c.est_price).label("price_max"),
             func.count(func.distinct(C2CItem.c2c_items_id)).label("recent_listed_count"),
         )
         .join(current_details, C2CItem.c2c_items_id == current_details.c.c2c_items_id)
-        .join(total_market_sq, C2CItem.c2c_items_id == total_market_sq.c.c2c_items_id)
         .where(current_details.c.items_id == items_id)
         .where(C2CItem.updated_at >= cutoff)
         .subquery()
@@ -1401,6 +1474,7 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
             select(
                 name_sq.label("name"),
                 img_url_sq.label("img_url"),
+                sku_id_sq.label("sku_id"),
                 stats_sq.c.price_min,
                 stats_sq.c.price_max,
                 stats_sq.c.recent_listed_count,
@@ -1412,10 +1486,12 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
 
     price_min = int(row.price_min) if row.price_min is not None else None
     price_max = int(row.price_max) if row.price_max is not None else None
+    sku_id = int(row.sku_id) if row.sku_id is not None else None
     recent_listed_count = int(row.recent_listed_count) if row.recent_listed_count is not None else 0
 
     return {
         "items_id": items_id,
+        "sku_id": sku_id,
         "name": row.name,
         "img_url": row.img_url,
         "price_min": price_min,
@@ -1426,46 +1502,32 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
-def get_product_price_history(items_id: int) -> List[Dict[str, Any]]:
+def get_product_price_history(items_id: int, sku_id: Optional[int] = None) -> List[Dict[str, Any]]:
     """Return product-level history from detail snapshots in the last 15 days."""
     backend = _require_sqlalchemy_backend()
     cutoff = _utc_cutoff(days=15)
-    total_market_sq = (
-        select(
-            C2CItemDetail.c2c_items_id.label("c2c_items_id"),
-            C2CItemDetail.snapshot_at.label("snapshot_at"),
-            func.sum(C2CItemDetail.market_price).label("total_market"),
-        )
-        .where(C2CItemDetail.snapshot_at.is_not(None))
-        .group_by(C2CItemDetail.c2c_items_id, C2CItemDetail.snapshot_at)
-        .subquery()
-    )
-    denom = case((total_market_sq.c.total_market > 0, total_market_sq.c.total_market), else_=1)
     with backend.session() as session:
-        rows = session.execute(
+        stmt = (
             select(
-                C2CItemDetail.snapshot_at.label("recorded_at"),
-                func.min(C2CItem.price * 1.0 * C2CItemDetail.market_price / denom).label("est_price"),
+                C2CItemSnapshot.snapshot_at.label("recorded_at"),
+                func.min(C2CItemSnapshot.est_price).label("est_price"),
                 C2CItem.c2c_items_name,
                 C2CItem.c2c_items_id,
             )
-            .join(C2CItem, C2CItem.c2c_items_id == C2CItemDetail.c2c_items_id)
-            .join(
-                total_market_sq,
-                and_(
-                    C2CItemDetail.c2c_items_id == total_market_sq.c.c2c_items_id,
-                    C2CItemDetail.snapshot_at == total_market_sq.c.snapshot_at,
-                ),
-            )
-            .where(C2CItemDetail.items_id == items_id)
-            .where(C2CItemDetail.snapshot_at >= cutoff)
+            .join(C2CItem, C2CItem.c2c_items_id == C2CItemSnapshot.c2c_items_id)
+            .join(Product, Product.id == C2CItemSnapshot.product_id)
+            .where(Product.items_id == items_id)
+            .where(C2CItemSnapshot.snapshot_at >= cutoff)
             .group_by(
-                C2CItemDetail.snapshot_at,
+                C2CItemSnapshot.snapshot_at,
                 C2CItem.c2c_items_name,
                 C2CItem.c2c_items_id,
             )
-            .order_by(C2CItemDetail.snapshot_at.asc())
-        ).all()
+            .order_by(C2CItemSnapshot.snapshot_at.asc())
+        )
+        if sku_id is not None:
+            stmt = stmt.where(Product.sku_id == sku_id)
+        rows = session.execute(stmt).all()
     history = []
     for row in rows:
         history.append({
@@ -1475,6 +1537,43 @@ def get_product_price_history(items_id: int) -> List[Dict[str, Any]]:
             "name": row[2],
             "c2c_items_id": row[3],
         })
+    return history
+
+
+def get_sku_price_history(sku_id: int) -> List[Dict[str, Any]]:
+    """Return SKU-level history from detail snapshots in the last 15 days."""
+    backend = _require_sqlalchemy_backend()
+    cutoff = _utc_cutoff(days=15)
+    with backend.session() as session:
+        rows = session.execute(
+            select(
+                C2CItemSnapshot.snapshot_at.label("recorded_at"),
+                func.min(C2CItemSnapshot.est_price).label("est_price"),
+                C2CItem.c2c_items_name,
+                C2CItem.c2c_items_id,
+            )
+            .join(C2CItem, C2CItem.c2c_items_id == C2CItemSnapshot.c2c_items_id)
+            .join(Product, Product.id == C2CItemSnapshot.product_id)
+            .where(Product.sku_id == sku_id)
+            .where(C2CItemSnapshot.snapshot_at >= cutoff)
+            .group_by(
+                C2CItemSnapshot.snapshot_at,
+                C2CItem.c2c_items_name,
+                C2CItem.c2c_items_id,
+            )
+            .order_by(C2CItemSnapshot.snapshot_at.asc())
+        ).all()
+    history: List[Dict[str, Any]] = []
+    for row in rows:
+        history.append(
+            {
+                "recorded_at": row[0],
+                "price": int(row[1]) if row[1] is not None else 0,
+                "show_price": f"{int(row[1] or 0) / 100:.2f}",
+                "name": row[2],
+                "c2c_items_id": row[3],
+            }
+        )
     return history
 
 
@@ -1503,8 +1602,16 @@ def get_market_item_recent_15d_listings(
         .limit(1)
         .scalar_subquery()
     )
+    sku_id_sq = (
+        select(current_details.c.sku_id)
+        .where(current_details.c.c2c_items_id == c2c_items_id)
+        .order_by(current_details.c.id.asc())
+        .limit(1)
+        .scalar_subquery()
+    )
     return _load_recent_15d_listings_page(
         items_id_expr=items_id_sq,
+        sku_id_expr=sku_id_sq,
         page=page,
         limit=limit,
         sort_by=sort_by,

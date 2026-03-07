@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.9.3] — 2026-03-07
+
+### Added
+
+- **Product Triple Table**: Added new `product` table keyed by `(blindbox_id, items_id, sku_id)` for normalized product metadata (`name`, `img_url`, `market_price`).
+- **Snapshot Table**: Added `c2c_items_snapshot` table to store per-listing component snapshots and proportional estimated prices over time.
+- **BLOB Compression Migration Script**: Added `src/bsm-cli/migrate_product_snapshot.py` to backfill `detail_blob` and migrate legacy data into `product` and `c2c_items_snapshot`.
+- **Migration Plan Doc**: Added `doc/C2C_PRODUCT_SNAPSHOT_BLOB_MIGRATION.md` documenting phased rollout, validation, and rollback.
+
+### Changed
+
+- **`c2c_items` Raw Detail Storage**: Added `detail_blob` + `detail_codec` (`gzip`) and switched runtime read path to prefer blob decode with JSON fallback.
+- **Scan Save Path Dual-Write**: `save_items` now writes:
+  - legacy `c2c_items_details`,
+  - normalized `product`,
+  - `c2c_items_snapshot` with proportional `est_price`,
+  while keeping `detail_json` for compatibility.
+- **Backfill Compatibility**: `src/backend/backfill_details.py` now supports blob-first detail parsing.
+
 ## [0.9.2] — 2026-03-06
 
 ### Added

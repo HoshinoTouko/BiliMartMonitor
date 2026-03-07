@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from sqlalchemy import ForeignKey, Index, Integer, Text, text
+from sqlalchemy import ForeignKey, Index, Integer, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -93,7 +93,7 @@ class C2CItem(Base):
     is_my_publish: Mapped[Optional[int]] = mapped_column(Integer)
     uface: Mapped[Optional[str]] = mapped_column(Text)
     uname: Mapped[Optional[str]] = mapped_column(Text)
-    detail_json: Mapped[Optional[str]] = mapped_column(Text)
+    detail_blob: Mapped[Optional[bytes]] = mapped_column()
     publish_status: Mapped[Optional[int]] = mapped_column(Integer)
     sale_status: Mapped[Optional[int]] = mapped_column(Integer)
     drop_reason: Mapped[Optional[str]] = mapped_column(Text)
@@ -103,35 +103,40 @@ class C2CItem(Base):
     )
 
 
-class C2CPriceHistory(Base):
-    __tablename__ = "c2c_price_history"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    c2c_items_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    price: Mapped[Optional[int]] = mapped_column(Integer)
-    show_price: Mapped[Optional[str]] = mapped_column(Text)
-    recorded_at: Mapped[Optional[str]] = mapped_column(
-        Text, server_default=text("CURRENT_TIMESTAMP")
-    )
-
-
-class C2CItemDetail(Base):
-    __tablename__ = "c2c_items_details"
+class Product(Base):
+    __tablename__ = "product"
     __table_args__ = (
-        Index("idx_c2c_details_items_id", "items_id"),
-        Index("idx_c2c_details_c2c_items_id", "c2c_items_id"),
-        Index("idx_c2c_details_c2c_snapshot_at", "c2c_items_id", "snapshot_at"),
+        UniqueConstraint("blindbox_id", "items_id", "sku_id", name="uq_product_triple"),
+        Index("idx_product_items_sku", "items_id", "sku_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    c2c_items_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    blindbox_id: Mapped[int] = mapped_column(Integer, nullable=False)
     items_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    sku_id: Mapped[int] = mapped_column(Integer, nullable=False)
     name: Mapped[Optional[str]] = mapped_column(Text)
     img_url: Mapped[Optional[str]] = mapped_column(Text)
     market_price: Mapped[Optional[int]] = mapped_column(Integer)
-    snapshot_at: Mapped[Optional[str]] = mapped_column(
+    created_at: Mapped[Optional[str]] = mapped_column(
         Text, server_default=text("CURRENT_TIMESTAMP")
     )
+    updated_at: Mapped[Optional[str]] = mapped_column(
+        Text, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class C2CItemSnapshot(Base):
+    __tablename__ = "c2c_items_snapshot"
+    __table_args__ = (
+        Index("idx_c2c_snapshot_c2c_at", "c2c_items_id", "snapshot_at"),
+        Index("idx_c2c_snapshot_product_id", "product_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    c2c_items_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot_at: Mapped[str] = mapped_column(Text, nullable=False)
+    product_id: Mapped[int] = mapped_column(ForeignKey("product.id", ondelete="RESTRICT"), nullable=False)
+    est_price: Mapped[Optional[int]] = mapped_column(Integer)
 
 
 class SystemMetadata(Base):
@@ -145,4 +150,3 @@ class SystemMetadata(Base):
 
 
 Index("idx_c2c_items_updated_at", C2CItem.updated_at)
-Index("idx_c2c_price_history_c2c_items_id", C2CPriceHistory.c2c_items_id)

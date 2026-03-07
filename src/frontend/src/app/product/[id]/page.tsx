@@ -17,6 +17,7 @@ import {
 
 interface ProductMetadata {
     items_id: number;
+    sku_id: number | null;
     name: string;
     img_url: string | null;
     price_min: number | null;
@@ -121,18 +122,19 @@ export default function ProductDetailPage() {
             setError("");
             try {
                 const itemData = await apiGet(`/api/market/product/${id}`) as { product?: ProductMetadata };
-                setItem(itemData.product ?? null);
+                const product = itemData.product ?? null;
+                setItem(product);
+                if (product?.sku_id != null) {
+                    const histData = await apiGet(`/api/product/${product.items_id}/${product.sku_id}/price-history`) as { history?: PricePoint[] };
+                    setHistory(histData.history ?? []);
+                } else {
+                    setHistory([]);
+                }
             } catch (e: unknown) {
                 setError(e instanceof Error ? e.message : "加载失败");
+                setHistory([]);
             } finally {
                 setLoading(false);
-            }
-            try {
-                const histData = await apiGet(`/api/market/product/${id}/price-history`) as { history?: PricePoint[] };
-                setHistory(histData.history ?? []);
-            } catch (e) {
-                console.error("加载历史价格失败", e);
-            } finally {
                 setLoadingChart(false);
             }
         };

@@ -17,7 +17,7 @@ if SRC_ROOT not in sys.path:
 
 from bsm import db
 from bsm import settings
-from bsm.orm_models import C2CItem, C2CItemDetail
+from bsm.orm_models import C2CItem, C2CItemSnapshot
 
 
 class DatabaseTestCase(unittest.TestCase):
@@ -272,8 +272,8 @@ class DatabaseTestCase(unittest.TestCase):
 
         backend = db._require_sqlalchemy_backend()
         with backend.session() as session:
-            detail_rows = session.query(C2CItemDetail).filter(C2CItemDetail.c2c_items_id == 4101).all()
-        self.assertEqual(len(detail_rows), 3, "Snapshot writes should be append-only")
+            snapshot_rows = session.query(C2CItemSnapshot).filter(C2CItemSnapshot.c2c_items_id == 4101).all()
+        self.assertEqual(len(snapshot_rows), 3, "Snapshot writes should be append-only")
 
         listings, _, _ = db.get_recent_15d_listings(61, page=1, limit=10, sort_by="TIME_DESC")
         self.assertEqual(len(listings), 1)
@@ -291,6 +291,17 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(settings["backend"], "sqlite")
         self.assertTrue(settings["db_url"].startswith("sqlite:///"))
         self.assertIsInstance(backend, db.SqlalchemyBackend)
+
+    def test_c2c_items_schema_has_only_detail_blob(self) -> None:
+        backend = db._require_sqlalchemy_backend()
+        raw_conn = backend._engine.raw_connection()
+        try:
+            columns = {row[1] for row in raw_conn.execute("PRAGMA table_info(c2c_items)").fetchall()}
+        finally:
+            raw_conn.close()
+        self.assertIn("detail_blob", columns)
+        self.assertNotIn("detail_json", columns)
+        self.assertNotIn("detail_codec", columns)
 
     def test_runtime_config_reads_price_and_discount_filters(self) -> None:
         with open(self.cfg_path, "w", encoding="utf-8") as f:
@@ -460,7 +471,7 @@ class DatabaseTestCase(unittest.TestCase):
         refreshed = settings.get_public_account_settings()
         self.assertEqual(refreshed["interval"], 45)
 
-    def test_database_size_report_counts_recent_rows_for_c2c_item_details(self) -> None:
+    def test_database_size_report_counts_recent_rows_for_c2c_item_snapshots(self) -> None:
         db.save_items(
             [
                 {
@@ -502,10 +513,10 @@ class DatabaseTestCase(unittest.TestCase):
             session.commit()
 
         report = db.get_database_size_report(days=7, top_n=50)
-        details_row = next((row for row in report["tables"] if row.get("name") == "c2c_items_details"), None)
-        self.assertIsNotNone(details_row)
-        self.assertEqual(int(details_row["row_count"]), 5)
-        self.assertEqual(int(details_row["recent_rows"]), 2)
+        snapshot_row = next((row for row in report["tables"] if row.get("name") == "c2c_items_snapshot"), None)
+        self.assertIsNotNone(snapshot_row)
+        self.assertEqual(int(snapshot_row["row_count"]), 5)
+        self.assertEqual(int(snapshot_row["recent_rows"]), 2)
 
 
 class AlembicMigrationTestCase(unittest.TestCase):
@@ -640,7 +651,7 @@ class AlembicMigrationTestCase(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_alembic_upgrade_backfills_detail_snapshots_from_price_history(self) -> None:
+    def test_alembic_upgrade_drops_legacy_c2c_items_details_table(self) -> None:
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute(
@@ -711,27 +722,10 @@ class AlembicMigrationTestCase(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         try:
-            detail_columns = {row[1] for row in conn.execute("PRAGMA table_info(c2c_items_details)").fetchall()}
-            self.assertIn("snapshot_at", detail_columns)
-
-            snapshot_rows = conn.execute(
-                """
-                SELECT snapshot_at, items_id, name, img_url, market_price
-                FROM c2c_items_details
-                WHERE c2c_items_id = 9001
-                ORDER BY snapshot_at ASC
-                """
-            ).fetchall()
-            self.assertEqual(len(snapshot_rows), 3)
-            snapshot_times = {row[0] for row in snapshot_rows}
-            self.assertIn("2026-03-01T00:00:00Z", snapshot_times)
-            self.assertIn("2026-03-02T00:00:00Z", snapshot_times)
-            self.assertIn("2026-03-05T00:00:00Z", snapshot_times)
-            for row in snapshot_rows:
-                self.assertEqual(row[1], 501)
-                self.assertEqual(row[2], "Legacy Detail")
-                self.assertEqual(row[3], "https://example.com/a.png")
-                self.assertEqual(row[4], 100)
+            table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            self.assertNotIn("c2c_items_details", table_names)
+            self.assertNotIn("c2c_price_history", table_names)
+            self.assertIn("c2c_items_snapshot", table_names)
         finally:
             conn.close()
 

@@ -26,7 +26,17 @@ interface MarketItem {
     created_at: string | null;
     updated_at: string | null;
     recent_listed_count?: number;
-    bundled_items?: { itemsId: number; name: string; imgUrl?: string; img?: string; pic?: string; image?: string }[];
+    bundled_items?: {
+        itemsId: number;
+        skuId?: number;
+        blindBoxId?: number;
+        blindboxId?: number;
+        name: string;
+        imgUrl?: string;
+        img?: string;
+        pic?: string;
+        image?: string;
+    }[];
     publish_status?: number | null;
     sale_status?: number | null;
     drop_reason?: string | null;
@@ -53,7 +63,17 @@ interface RecentListing {
     publish_status?: number | null;
     sale_status?: number | null;
     drop_reason?: string | null;
-    bundled_items?: { itemsId: number; name: string; imgUrl?: string; img?: string; pic?: string; image?: string }[];
+    bundled_items?: {
+        itemsId: number;
+        skuId?: number;
+        blindBoxId?: number;
+        blindboxId?: number;
+        name: string;
+        imgUrl?: string;
+        img?: string;
+        pic?: string;
+        image?: string;
+    }[];
 }
 
 interface ChartDataPoint {
@@ -153,17 +173,20 @@ export default function MarketItemDetailPage() {
             try {
                 const itemData = await apiGet(`/api/market/items/${id}`) as { item?: MarketItem };
                 setItem(itemData.item ?? null);
+                const firstBundled = itemData.item?.bundled_items?.[0];
+                const itemsId = firstBundled?.itemsId;
+                const skuId = firstBundled?.skuId;
+                if (itemsId != null && skuId != null) {
+                    const histData = await apiGet(`/api/product/${itemsId}/${skuId}/price-history`) as { history?: PricePoint[] };
+                    setHistory(histData.history ?? []);
+                } else {
+                    setHistory([]);
+                }
             } catch (e: unknown) {
+                console.error("加载历史价格失败", e);
                 setError(e instanceof Error ? e.message : "加载失败");
             } finally {
                 setLoading(false);
-            }
-            try {
-                const histData = await apiGet(`/api/market/items/${id}/price-history`) as { history?: PricePoint[] };
-                setHistory(histData.history ?? []);
-            } catch (e) {
-                console.error("加载历史价格失败", e);
-            } finally {
                 setLoadingChart(false);
             }
         };
@@ -215,6 +238,28 @@ export default function MarketItemDetailPage() {
             publish_status: recentListings.find(l => l.c2c_items_id === h.c2c_items_id)?.publish_status,
             sale_status: recentListings.find(l => l.c2c_items_id === h.c2c_items_id)?.sale_status,
         }));
+
+    const blindBoxIds = Array.from(
+        new Set(
+            (item?.bundled_items ?? [])
+                .map((b) => b.blindBoxId ?? b.blindboxId)
+                .filter((v): v is number => Number.isFinite(v))
+        )
+    );
+    const bundledItemIds = Array.from(
+        new Set(
+            (item?.bundled_items ?? [])
+                .map((b) => b.itemsId)
+                .filter((v): v is number => Number.isFinite(v))
+        )
+    );
+    const bundledSkuIds = Array.from(
+        new Set(
+            (item?.bundled_items ?? [])
+                .map((b) => b.skuId)
+                .filter((v): v is number => Number.isFinite(v))
+        )
+    );
 
     // Price delta
     const priceMin =
@@ -385,6 +430,23 @@ export default function MarketItemDetailPage() {
                                             </span>
                                         )}
                                     </h2>
+                                    {(blindBoxIds.length > 0 || bundledItemIds.length > 0 || bundledSkuIds.length > 0) && (
+                                        <div
+                                            style={{
+                                                marginTop: "-0.125rem",
+                                                marginBottom: "0.5rem",
+                                                fontSize: "0.75rem",
+                                                color: "var(--text-muted)",
+                                                lineHeight: 1.3,
+                                            }}
+                                        >
+                                            盲盒ID：{blindBoxIds.length > 0 ? blindBoxIds.join(", ") : "—"}
+                                            {" | "}
+                                            Item ID：{bundledItemIds.length > 0 ? bundledItemIds.join(", ") : "—"}
+                                            {" | "}
+                                            SKU ID：{bundledSkuIds.length > 0 ? bundledSkuIds.join(", ") : "—"}
+                                        </div>
+                                    )}
                                     <div className="bsm-detail-prices">
                                         <span className="bsm-detail-price-current">
                                             当前价格：<strong>¥ {item.show_price ?? "—"}</strong>
