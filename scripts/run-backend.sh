@@ -29,10 +29,14 @@ fi
 # Run Database Migrations
 # ---------------------------------------------------------------------------
 echo "Running database migrations..."
-if [ -x ".venv/bin/alembic" ]; then
-    .venv/bin/alembic upgrade head
+ALEMBIC_BIN="src/backend/.venv/bin/alembic"
+if [ -x "$ALEMBIC_BIN" ]; then
+    "$ALEMBIC_BIN" upgrade head
+elif "$PYTHON_BIN" -c "from alembic.config import main; main(argv=['upgrade','head'])" >/dev/null 2>&1; then
+    "$PYTHON_BIN" -c "from alembic.config import main; main(argv=['upgrade','head'])"
 else
-    echo "Warning: alembic not found in .venv/bin/"
+    echo "Warning: alembic not installed in src/backend/.venv (skip migrations)"
+    echo "         Run: src/backend/.venv/bin/pip install alembic"
 fi
 
 

@@ -17,7 +17,7 @@ def run_backfill():
     with backend.session() as session:
         session.query(C2CItemDetail).delete()
         rows = (
-            session.query(C2CItem.c2c_items_id, C2CItem.detail_json)
+            session.query(C2CItem.c2c_items_id, C2CItem.detail_json, C2CItem.updated_at, C2CItem.created_at)
             .filter(C2CItem.updated_at >= cutoff)
             .all()
         )
@@ -26,11 +26,12 @@ def run_backfill():
         print(f"Found {total} records from the last 15 days to backfill.")
 
         detail_models = []
-        for c2c_items_id, detail_json in rows:
+        for c2c_items_id, detail_json, updated_at, created_at in rows:
             try:
                 detail_list = json.loads(detail_json)
                 if not isinstance(detail_list, list):
                     continue
+                snapshot_at = updated_at or created_at or _utc_cutoff(seconds=0)
                 for d_item in detail_list:
                     items_id = d_item.get("itemsId")
                     if items_id:
@@ -41,6 +42,7 @@ def run_backfill():
                                 name=d_item.get("name", ""),
                                 img_url=_extract_img_from_detail_json(json.dumps([d_item])),
                                 market_price=d_item.get("marketPrice", 0),
+                                snapshot_at=snapshot_at,
                             )
                         )
                         inserted += 1

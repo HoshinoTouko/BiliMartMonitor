@@ -182,10 +182,9 @@ class MarketAPITestCase(unittest.TestCase):
         updated["showPrice"] = "95.00"
         db.save_items([updated])
         history = db.get_item_price_history(2001)
-        self.assertEqual(len(history), 2, "Should record initial + changed price")
-        prices = [h["price"] for h in history]
-        self.assertIn(10000, prices)
-        self.assertIn(9500, prices)
+        self.assertEqual(len(history), 1, "Price history now follows detail snapshots")
+        self.assertEqual(history[0]["price"], 9500)
+        self.assertEqual(history[0]["show_price"], "95.00")
 
     def test_price_history_no_duplicate_on_same_price(self) -> None:
         db.save_items([SAMPLE_ITEMS[0]])
@@ -200,10 +199,8 @@ class MarketAPITestCase(unittest.TestCase):
         updated["showPrice"] = "95.00"
         db.save_items([updated])
         history = db.get_item_price_history(2001)
-        self.assertEqual(len(history), 2)
-        # First entry is oldest (ASC order)
-        self.assertEqual(history[0]["price"], 10000)
-        self.assertEqual(history[1]["price"], 9500)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["price"], 9500)
 
     def test_price_history_empty_for_unknown_item(self) -> None:
         history = db.get_item_price_history(9999)

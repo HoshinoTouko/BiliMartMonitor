@@ -120,6 +120,7 @@ class C2CItemDetail(Base):
     __table_args__ = (
         Index("idx_c2c_details_items_id", "items_id"),
         Index("idx_c2c_details_c2c_items_id", "c2c_items_id"),
+        Index("idx_c2c_details_c2c_snapshot_at", "c2c_items_id", "snapshot_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -128,6 +129,9 @@ class C2CItemDetail(Base):
     name: Mapped[Optional[str]] = mapped_column(Text)
     img_url: Mapped[Optional[str]] = mapped_column(Text)
     market_price: Mapped[Optional[int]] = mapped_column(Integer)
+    snapshot_at: Mapped[Optional[str]] = mapped_column(
+        Text, server_default=text("CURRENT_TIMESTAMP")
+    )
 
 
 class SystemMetadata(Base):
