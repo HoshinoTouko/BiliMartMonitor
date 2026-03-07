@@ -101,6 +101,16 @@ class C2CItem(Base):
     updated_at: Mapped[Optional[str]] = mapped_column(
         Text, server_default=text("CURRENT_TIMESTAMP")
     )
+    snapshots: Mapped[List["C2CItemSnapshot"]] = relationship(
+        back_populates="c2c_item",
+        passive_deletes=True,
+    )
+    products: Mapped[List["Product"]] = relationship(
+        secondary="c2c_items_snapshot",
+        primaryjoin="C2CItem.c2c_items_id == C2CItemSnapshot.c2c_items_id",
+        secondaryjoin="Product.id == C2CItemSnapshot.product_id",
+        viewonly=True,
+    )
 
 
 class Product(Base):
@@ -123,6 +133,16 @@ class Product(Base):
     updated_at: Mapped[Optional[str]] = mapped_column(
         Text, server_default=text("CURRENT_TIMESTAMP")
     )
+    snapshots: Mapped[List["C2CItemSnapshot"]] = relationship(
+        back_populates="product",
+        passive_deletes=True,
+    )
+    c2c_items: Mapped[List["C2CItem"]] = relationship(
+        secondary="c2c_items_snapshot",
+        primaryjoin="Product.id == C2CItemSnapshot.product_id",
+        secondaryjoin="C2CItem.c2c_items_id == C2CItemSnapshot.c2c_items_id",
+        viewonly=True,
+    )
 
 
 class C2CItemSnapshot(Base):
@@ -133,10 +153,15 @@ class C2CItemSnapshot(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    c2c_items_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    c2c_items_id: Mapped[int] = mapped_column(
+        ForeignKey("c2c_items.c2c_items_id", ondelete="CASCADE"),
+        nullable=False,
+    )
     snapshot_at: Mapped[str] = mapped_column(Text, nullable=False)
     product_id: Mapped[int] = mapped_column(ForeignKey("product.id", ondelete="RESTRICT"), nullable=False)
     est_price: Mapped[Optional[int]] = mapped_column(Integer)
+    c2c_item: Mapped[C2CItem] = relationship(back_populates="snapshots")
+    product: Mapped[Product] = relationship(back_populates="snapshots")
 
 
 class SystemMetadata(Base):

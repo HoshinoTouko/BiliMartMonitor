@@ -8,6 +8,7 @@
 - **Snapshot Table**: Added `c2c_items_snapshot` table to store per-listing component snapshots and proportional estimated prices over time.
 - **BLOB Compression Migration Script**: Added `src/bsm-cli/migrate_product_snapshot.py` to backfill `detail_blob` and migrate legacy data into `product` and `c2c_items_snapshot`.
 - **Migration Plan Doc**: Added `doc/C2C_PRODUCT_SNAPSHOT_BLOB_MIGRATION.md` documenting phased rollout, validation, and rollback.
+- **Snapshot Reverse FK Migration**: Added alembic migration `d1f3a6b8c901_add_fk_from_snapshot_to_c2c_items.py` to enforce `c2c_items_snapshot.c2c_items_id -> c2c_items.c2c_items_id` with `ON DELETE CASCADE`.
 
 ### Changed
 
@@ -18,6 +19,7 @@
   - `c2c_items_snapshot` with proportional `est_price`,
   while keeping `detail_json` for compatibility.
 - **Backfill Compatibility**: `src/backend/backfill_details.py` now supports blob-first detail parsing.
+- **ORM Reverse Links**: Added bidirectional ORM relationships for `C2CItem <-> C2CItemSnapshot <-> Product`, including view-only `C2CItem.products` and `Product.c2c_items`.
 
 ## [0.9.2] — 2026-03-06
 

@@ -1,5 +1,34 @@
 # Work Log
 
+## 2026-03-07 Snapshot Reverse FK + ORM Backrefs
+
+### Planned
+
+- Add missing reverse linkage from `c2c_items` to `c2c_items_snapshot` at both DB constraint and ORM levels.
+- Keep existing product triple model unchanged.
+
+### Step Log
+
+1. Added ORM relationships in `src/bsm/orm_models.py`:
+   - `C2CItem.snapshots`
+   - `C2CItem.products` (view-only through `c2c_items_snapshot`)
+   - `Product.snapshots`
+   - `Product.c2c_items` (view-only through `c2c_items_snapshot`)
+   - `C2CItemSnapshot.c2c_item` and `C2CItemSnapshot.product`
+2. Changed `C2CItemSnapshot.c2c_items_id` to a real foreign key:
+   - `ForeignKey("c2c_items.c2c_items_id", ondelete="CASCADE")`
+3. Added alembic migration `d1f3a6b8c901_add_fk_from_snapshot_to_c2c_items.py`:
+   - creates FK `fk_c2c_snapshot_c2c_items_id` if absent
+   - includes safe no-op checks for partial/legacy states
+   - supports downgrade by dropping that FK
+
+### Verification
+
+- `pytest -q src/backend/testsuite/test_db.py src/backend/testsuite/test_market_router.py`
+- `alembic upgrade head` on local SQLite and `PRAGMA foreign_key_list('c2c_items_snapshot')` confirms both snapshot FKs:
+  - `product_id -> product.id`
+  - `c2c_items_id -> c2c_items.c2c_items_id`
+
 ## 2026-03-07 Product Triple + Snapshot + BLOB Compression Migration
 
 ### Planned
