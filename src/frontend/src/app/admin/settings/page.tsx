@@ -66,30 +66,6 @@ interface DbSizeReport {
     warnings?: string[];
 }
 
-interface DbPruneResult {
-    ok?: boolean;
-    job_id?: string;
-}
-
-interface DbPruneStatus {
-    is_running: boolean;
-    progress_percent: number;
-    processed_items: number;
-    total_items: number;
-    orphan_total_before_batch?: number;
-    scanned_orphan_items?: number;
-    success_count: number;
-    skipped_count: number;
-    created_products: number;
-    created_snapshots: number;
-    skipped_empty_detail?: number;
-    skipped_without_items_id?: number;
-    fallback_detail_json_used?: number;
-    error_count?: number;
-    error_samples?: Array<{ c2c_items_id: number; reason: string }>;
-    error?: string | null;
-}
-
 type LogStage = "WAIT" | "EXEC" | null;
 
 const LEVEL_COLORS: Record<string, string> = {
@@ -145,10 +121,6 @@ export default function SystemSettingsPage() {
     const [dbSize, setDbSize] = useState<DbSizeReport | null>(null);
     const [dbSizeError, setDbSizeError] = useState<string | null>(null);
     const [loadingDbSize, setLoadingDbSize] = useState(false);
-    const [pruningDb, setPruningDb] = useState(false);
-    const [dbPruneMsg, setDbPruneMsg] = useState<string | null>(null);
-    const [dbPruneProgress, setDbPruneProgress] = useState(0);
-    const [dbPruneCounterText, setDbPruneCounterText] = useState<string | null>(null);
 
     // Editable fields
     const [scanMode, setScanMode] = useState("latest");
@@ -227,73 +199,6 @@ export default function SystemSettingsPage() {
             setLoadingDbSize(false);
         }
     }, []);
-
-    const handlePruneDbOrphans = useCallback(async () => {
-        const confirmed = window.confirm("确认扫描无关联 product 的旧数据，并根据 detail_blob 补建 product/snapshot 吗？每次最多处理 2000 条。");
-        if (!confirmed) return;
-        setPruningDb(true);
-        setDbPruneProgress(0);
-        setDbPruneCounterText("0/0");
-        setDbPruneMsg(null);
-        try {
-            let started = false;
-            try {
-                await apiPost<DbPruneResult>("/api/settings/db-prune-orphans/start", {});
-                started = true;
-            } catch (e) {
-                const msg = e instanceof Error ? e.message : String(e);
-                const attachable =
-                    msg.includes("repair job is already running")
-                    || msg.includes("HTTP 502")
-                    || msg.includes("Bad Gateway");
-                if (!attachable) throw e;
-                setDbPruneMsg("任务可能已启动，正在附着到当前修复任务…");
-            }
-
-            let finalStatus: DbPruneStatus | null = null;
-            let consecutivePollErrors = 0;
-            for (let i = 0; i < 900; i += 1) {
-                try {
-                    const status = await apiGet<DbPruneStatus>("/api/settings/db-prune-orphans/status");
-                    finalStatus = status;
-                    consecutivePollErrors = 0;
-                    setDbPruneProgress(status.progress_percent || 0);
-                    setDbPruneCounterText(`${status.processed_items || 0}/${status.total_items || 0}`);
-                    if (!status.is_running && (status.processed_items > 0 || started)) break;
-                } catch {
-                    consecutivePollErrors += 1;
-                    if (consecutivePollErrors >= 10) {
-                        throw new Error("状态轮询失败次数过多，请稍后重试");
-                    }
-                }
-                await new Promise((resolve) => window.setTimeout(resolve, 400));
-            }
-
-            if (finalStatus?.error) {
-                setDbPruneMsg(`清理失败：${finalStatus.error}`);
-            } else if (finalStatus) {
-                const sampleErrors = (finalStatus.error_samples || []).slice(0, 3)
-                    .map((item) => `${item.c2c_items_id}:${item.reason}`)
-                    .join(" | ");
-                setDbPruneMsg(
-                    `成功 ${finalStatus.success_count} 条（扫描无关联 ${finalStatus.scanned_orphan_items ?? finalStatus.processed_items}/${finalStatus.orphan_total_before_batch ?? finalStatus.total_items}，新建 product ${finalStatus.created_products}、snapshot ${finalStatus.created_snapshots}；空明细 ${finalStatus.skipped_empty_detail ?? 0}，缺 itemsId ${finalStatus.skipped_without_items_id ?? 0}，错误 ${finalStatus.error_count ?? 0}${sampleErrors ? `；示例 ${sampleErrors}` : ""}）`
-                    + `，JSON回退命中 ${finalStatus.fallback_detail_json_used ?? 0}`
-                );
-                setDbPruneProgress(100);
-            } else {
-                setDbPruneMsg("清理失败：未获取到任务状态");
-            }
-            await handleLoadDbSize();
-        } catch (e) {
-            setDbPruneMsg(`清理失败：${e instanceof Error ? e.message : "未知错误"}`);
-        } finally {
-            setPruningDb(false);
-            window.setTimeout(() => {
-                setDbPruneProgress(0);
-                setDbPruneCounterText(null);
-            }, 1200);
-        }
-    }, [handleLoadDbSize]);
 
     // Poll cron status every 3s
     useEffect(() => {
@@ -952,43 +857,12 @@ export default function SystemSettingsPage() {
                             className="bsm-btn bsm-btn-outline"
                             style={{ padding: "0.35rem 0.65rem", fontSize: "0.85rem", height: "auto" }}
                             onClick={handleLoadDbSize}
-                            disabled={loadingDbSize || pruningDb}
+                            disabled={loadingDbSize}
                         >
                             {loadingDbSize ? "诊断中…" : (dbSize ? "重新诊断" : "开始诊断")}
                         </button>
-                        <button
-                            type="button"
-                            className="bsm-btn bsm-btn-outline"
-                            style={{ padding: "0.35rem 0.65rem", fontSize: "0.85rem", height: "auto" }}
-                            onClick={handlePruneDbOrphans}
-                            disabled={pruningDb || loadingDbSize}
-                        >
-                            {pruningDb ? "处理中…" : "修复无关联旧数据"}
-                        </button>
                     </div>
                 </div>
-                {dbPruneMsg ? (
-                    <div className="bsm-text-muted" style={{ marginBottom: "0.625rem" }}>
-                        {dbPruneMsg}
-                    </div>
-                ) : null}
-                {(pruningDb || dbPruneProgress > 0) ? (
-                    <div style={{ marginBottom: "0.625rem" }}>
-                        <div className="bsm-text-muted" style={{ fontSize: "0.8rem", marginBottom: "0.35rem" }}>
-                            修复进度 {dbPruneProgress}% {dbPruneCounterText ? `(${dbPruneCounterText})` : ""}
-                        </div>
-                        <div style={{ width: "100%", height: "8px", background: "rgba(148, 163, 184, 0.28)", borderRadius: "999px", overflow: "hidden" }}>
-                            <div
-                                style={{
-                                    width: `${dbPruneProgress}%`,
-                                    height: "100%",
-                                    background: "linear-gradient(90deg, var(--brand-accent), #22c55e)",
-                                    transition: "width 220ms ease",
-                                }}
-                            />
-                        </div>
-                    </div>
-                ) : null}
                 {dbSizeError ? (
                     <div className="bsm-alert bsm-alert-error" style={{ marginBottom: 0 }}>
                         {dbSizeError}

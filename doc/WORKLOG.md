@@ -1,5 +1,38 @@
 # Work Log
 
+## 2026-03-08 Scan Log Duration Split, D1 Diagnostics Timeout Mitigation, and Orphan-Repair API Removal
+
+### Planned
+
+- Split scan completion duration logs into API fetch and DB write durations.
+- Mitigate `db-size` timeout on Cloudflare D1 by avoiding heavy diagnostics queries.
+- Remove obsolete orphan-repair APIs and frontend controls.
+- Harden Cloudflare Docker frontend dependency install against flaky registry/network.
+
+### Step Log
+
+1. Updated scan completion log format in `src/backend/cron_runner.py`:
+   - from single `耗时 xxx ms`
+   - to split `耗时 API xxx ms | DB xxx ms`.
+2. Kept DB write path asynchronous in cron scan flow and reused per-job DB duration for logging/summary fields.
+3. Reworked `get_database_size_report` D1 path in `src/bsm/db.py`:
+   - added lightweight branch for Cloudflare/D1-like backends,
+   - skipped timeout-prone payload-size estimation queries,
+   - returned `table_bytes/index_bytes/total_bytes = null` in lightweight mode.
+4. Removed orphan-repair endpoints and runtime state from `src/backend/routers/settings.py`:
+   - `POST /api/settings/db-prune-orphans`
+   - `POST /api/settings/db-prune-orphans/start`
+   - `GET /api/settings/db-prune-orphans/status`
+5. Removed orphan-repair UI button/progress/polling logic from `src/frontend/src/app/admin/settings/page.tsx`.
+6. Updated Cloudflare image build in `Dockerfile.CloudFlare`:
+   - moved `pnpm` registry/retry/timeout configuration into `frontend-builder` stage right after `corepack enable pnpm`.
+
+### Verification
+
+- `python3 -m unittest src/backend/testsuite/test_cron_runner.py`
+- `python3 -m unittest src/backend/testsuite/test_settings_router.py src/backend/testsuite/test_db.py`
+- `pnpm -C src/frontend exec tsc --noEmit`
+
 ## 2026-03-07 DB Repair UX, Password Security, Timestamp Standardization, and Alembic Squash
 
 ### Planned

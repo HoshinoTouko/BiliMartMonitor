@@ -980,6 +980,7 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
     backend_name = get_db_backend_name()
     days = max(1, min(int(days or 7), 3650))
     top_n = max(1, min(int(top_n or 20), 200))
+    is_d1_like = backend_name == "cloudflare" or dialect == "cloudflare_d1"
 
     tables = sorted(inspector.get_table_names())
     utc_now = datetime.now(timezone.utc)
@@ -997,6 +998,77 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
     warnings: List[str] = []
 
     with engine.connect() as conn:
+        if is_d1_like:
+            # D1 remote SQL can time out on full table scans; keep diagnostics lightweight.
+            table_rows: List[Dict[str, Any]] = []
+            warnings.append("cloudflare d1 diagnostics use lightweight mode to avoid query timeouts")
+            for table_name in tables:
+                if table_name.startswith("_cf_") or table_name.startswith("sqlite_"):
+                    skipped_tables.append(table_name)
+                    continue
+                row_count = 0
+                recent_rows: Optional[int] = None
+                quoted_table = identifier_preparer.quote(table_name)
+                if table_name in {"c2c_items", "c2c_items_snapshot", "product"}:
+                    try:
+                        row_count = int(conn.execute(sa.text(f"SELECT COUNT(*) FROM {quoted_table}")).scalar() or 0)
+                    except Exception:
+                        row_count = 0
+                if table_name == "c2c_items":
+                    try:
+                        recent_rows = int(
+                            conn.execute(
+                                sa.text(
+                                    f"""
+                                    SELECT COUNT(*) FROM {quoted_table}
+                                    WHERE datetime(COALESCE(updated_at, created_at)) >= datetime(:cutoff)
+                                    """
+                                ),
+                                {"cutoff": cutoff},
+                            ).scalar()
+                            or 0
+                        )
+                    except Exception:
+                        recent_rows = None
+                table_rows.append(
+                    {
+                        "name": table_name,
+                        "row_count": row_count,
+                        "recent_rows": recent_rows,
+                        "table_bytes": None,
+                        "index_bytes": None,
+                        "total_bytes": None,
+                    }
+                )
+
+            table_rows.sort(
+                key=lambda item: (
+                    int(item.get("row_count") or 0),
+                    str(item.get("name") or ""),
+                ),
+                reverse=True,
+            )
+            top_tables = table_rows[:top_n]
+            total_rows = sum(int(item.get("row_count") or 0) for item in table_rows)
+            recent_total_rows = sum(int(item.get("recent_rows") or 0) for item in table_rows if item.get("recent_rows") is not None)
+            return {
+                "generated_at": generated_at,
+                "backend": get_db_backend_name(),
+                "dialect": dialect,
+                "days_window": days,
+                "table_count": len(table_rows),
+                "total_rows": total_rows,
+                "recent_total_rows": recent_total_rows,
+                "total_db_bytes": None,
+                "used_db_bytes": None,
+                "free_db_bytes": None,
+                "wal_bytes": None,
+                "tables_total_bytes": 0,
+                "skipped_tables": skipped_tables,
+                "warnings": warnings,
+                "tables": top_tables,
+            }
+
         if dialect == "sqlite":
             if backend.sqlite_path:
                 db_path = Path(backend.sqlite_path)
@@ -1150,54 +1222,9 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                 )
                 total_relation_bytes = table_bytes + index_bytes
             elif backend_name == "cloudflare" or dialect == "cloudflare_d1":
-                # D1 does not expose per-table bytes directly; estimate by row payload and index key width.
-                quoted_columns = [
-                    identifier_preparer.quote(str(col.get("name") or ""))
-                    for col in inspector.get_columns(table_name)
-                    if str(col.get("name") or "").strip()
-                ]
-                avg_row_payload = 0.0
-                if quoted_columns:
-                    sum_expr = " + ".join(f"COALESCE(LENGTH(CAST({col_name} AS BLOB)), 0)" for col_name in quoted_columns)
-                    try:
-                        avg_row_payload = float(
-                            conn.execute(
-                                sa.text(f"SELECT COALESCE(AVG({sum_expr}), 0) FROM {quoted_table}")
-                            ).scalar()
-                            or 0.0
-                        )
-                    except Exception:
-                        avg_row_payload = 0.0
-                row_overhead = 24.0
-                table_bytes = int(max(0.0, (avg_row_payload + row_overhead) * float(row_count)))
-
-                idx_total = 0.0
-                try:
-                    idx_defs = inspector.get_indexes(table_name)
-                except Exception:
-                    idx_defs = []
-                for idx_def in idx_defs:
-                    col_names = [
-                        identifier_preparer.quote(str(name))
-                        for name in (idx_def.get("column_names") or [])
-                        if str(name or "").strip()
-                    ]
-                    if not col_names:
-                        continue
-                    idx_expr = " + ".join(f"COALESCE(LENGTH(CAST({col_name} AS BLOB)), 0)" for col_name in col_names)
-                    try:
-                        avg_key_payload = float(
-                            conn.execute(
-                                sa.text(f"SELECT COALESCE(AVG({idx_expr}), 0) FROM {quoted_table}")
-                            ).scalar()
-                            or 0.0
-                        )
-                    except Exception:
-                        avg_key_payload = 0.0
-                    idx_entry_overhead = 16.0
-                    idx_total += max(0.0, (avg_key_payload + idx_entry_overhead) * float(row_count))
-                index_bytes = int(idx_total)
-                total_relation_bytes = table_bytes + index_bytes
+                table_bytes = None
+                index_bytes = None
+                total_relation_bytes = None
 
             table_rows.append(
                 {
@@ -1226,7 +1253,7 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                 item["total_bytes"] = est_total
             warnings.append("sqlite dbstat unavailable; table/index sizes are estimated by row count")
     if (backend_name == "cloudflare" or dialect == "cloudflare_d1") and table_rows:
-        warnings.append("cloudflare d1 table/index sizes are estimated from row payload and index key width")
+        warnings.append("cloudflare d1 table/index sizes are unavailable in full mode")
 
     table_rows.sort(
         key=lambda item: (

@@ -443,6 +443,38 @@ def _run_scan_once() -> dict:
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
+        db_futures: dict[concurrent.futures.Future[dict[str, object]], dict[str, object]] = {}
+        db_results: dict[tuple[str | None, int], dict[str, object]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(category_jobs))) as db_executor:
+            for job in category_jobs:
+                if str(job.get("error") or "").strip():
+                    continue
+
+                items = list(job.get("items") or [])
+
+                def _run_db_pipeline(job_items: list[dict]) -> dict[str, object]:
+                    db_started_at = time.perf_counter()
+                    new_items = filter_new_items(job_items)
+                    saved, inserted = save_items(job_items)
+                    db_duration_ms = int((time.perf_counter() - db_started_at) * 1000)
+                    return {
+                        "new_items": new_items,
+                        "saved": int(saved),
+                        "inserted": int(inserted),
+                        "db_duration_ms": db_duration_ms,
+                    }
+
+                future = db_executor.submit(_run_db_pipeline, items)
+                db_futures[future] = {
+                    "category": job.get("category"),
+                    "page": int(job.get("page") or 0),
+                }
+
+            for future, meta in db_futures.items():
+                category_key = meta.get("category")
+                page_key = int(meta.get("page") or 0)
+                db_results[(category_key, page_key)] = future.result()
+
         total_count = 0
         total_saved = 0
         total_inserted = 0
@@ -475,11 +507,15 @@ def _run_scan_once() -> dict:
 
             items = list(job.get("items") or [])
             next_id = job.get("next_id")
-            new_items = filter_new_items(items)
-            saved, inserted = save_items(items)
+            db_result = db_results.get((category, page)) or {}
+            new_items = list(db_result.get("new_items") or [])
+            saved = int(db_result.get("saved") or 0)
+            inserted = int(db_result.get("inserted") or 0)
+            db_duration_ms = int(db_result.get("db_duration_ms") or 0)
+            total_duration_ms = duration_ms + db_duration_ms
             total_count += len(items)
-            total_saved += int(saved)
-            total_inserted += int(inserted)
+            total_saved += saved
+            total_inserted += inserted
             notify_items.extend(new_items)
 
             should_reset_on_repeat = mode == "continue_until_repeat" and len(new_items) < len(items)
@@ -505,12 +541,14 @@ def _run_scan_once() -> dict:
                 "category_key": _category_key(category),
                 "category_label": _category_label(category),
                 "count": len(items),
-                "inserted": int(inserted),
+                "inserted": inserted,
                 "did_reset_cursor": did_reset_cursor,
-                "duration_ms": duration_ms,
+                "duration_ms": total_duration_ms,
+                "request_duration_ms": duration_ms,
+                "db_duration_ms": db_duration_ms,
             })
             _log_exec(
-                f"扫描完成 | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | {len(items)} 条 | 新增 {inserted} 条 | 耗时 {duration_ms} ms"
+                f"扫描完成 | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | {len(items)} 条 | 新增 {inserted} 条 | 耗时 API {duration_ms} ms | DB {db_duration_ms} ms"
             )
             _log_wait(f"下次扫描 | 分类 {_category_label(category)} | 第 {_mode_page(mode, category)} 页")
             if username and username not in session_errors:

@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.9.5.2] — 2026-03-08
+
+### Changed
+
+- **Scan Duration Log Format**: `扫描完成` logs now report split durations as `耗时 API ... ms | DB ... ms` to distinguish remote fetch time from database write time.
+- **DB Size Diagnostics (D1)**: `GET /api/settings/db-size` now uses a lightweight Cloudflare D1 path to reduce timeout risk from heavy full-table estimation queries.
+- **Cloudflare Docker Build Stability**: `Dockerfile.CloudFlare` now configures pnpm registry/retry/network timeout in the frontend builder stage before `pnpm install`.
+
+### Removed
+
+- **Orphan Repair Endpoints**: Removed deprecated admin APIs:
+  - `POST /api/settings/db-prune-orphans`
+  - `POST /api/settings/db-prune-orphans/start`
+  - `GET /api/settings/db-prune-orphans/status`
+- **Orphan Repair UI Controls**: Removed "修复无关联旧数据" action and related progress/polling logic from `/admin/settings`.
+
+### Tests
+
+- Added cron log regression assertions for split duration markers (`耗时 API`, `DB`).
+- Added settings router regression test to ensure removed orphan-repair endpoints return `404`.
+- Verified suites:
+  - `test_cron_runner.py`
+  - `test_settings_router.py`
+  - `test_db.py`
+  - frontend `tsc --noEmit`
+
 ## [0.9.5.1] — 2026-03-08
 
 ### Added

@@ -42,19 +42,19 @@ Each table item includes:
   - `updated_at`
   - `recorded_at`
   - `created_at`
-- `c2c_items_details` is special-cased:
+- `c2c_items_snapshot` is special-cased:
   - `recent_rows` is calculated via join to `c2c_items` using:
   - `COALESCE(c2c_items.updated_at, c2c_items.created_at) >= cutoff`
-  - This reflects detail growth tied to active listing updates.
+  - This reflects snapshot growth tied to active listing updates.
 
 ## Cloudflare D1 notes
 
-Cloudflare D1 may expose internal tables (for example `_cf_*`) that are not readable by normal SQL (`SQLITE_AUTH`).
+Cloudflare D1 may expose internal tables (for example `_cf_*`) that are not readable by normal SQL (`SQLITE_AUTH`), and may time out on full-table diagnostic scans.
 
 Diagnostics behavior:
 - Internal/system tables are skipped.
-- Single-table query failures are downgraded to warnings.
-- The whole diagnostics request still returns partial results instead of failing.
+- Diagnostics use a lightweight mode to avoid timeout-prone queries.
+- In lightweight mode, table/index byte fields are not estimated and are returned as `null`.
 
 ## Admin UI behavior
 

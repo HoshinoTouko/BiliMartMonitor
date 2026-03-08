@@ -147,6 +147,7 @@ class CronRunnerTestCase(unittest.TestCase):
         info_messages = [call.args[0] for call in mock_info.call_args_list]
         self.assertTrue(any("开始扫描 | 账号 tester | 分类 手办 | 模式 continue | 第 " in message for message in info_messages))
         self.assertTrue(any("扫描完成 | 分类 手办 | 模式 continue | 第 " in message and "| 2 条 | 新增 1 条" in message for message in info_messages))
+        self.assertTrue(any("扫描完成 | 分类 手办 | 模式 continue | 第 " in message and "| 耗时 API " in message and "| DB " in message for message in info_messages))
         self.assertTrue(any("下次扫描 | 分类 手办 | 第 " in message for message in info_messages))
 
     @patch("bsm.notify.load_notifier")
@@ -202,6 +203,7 @@ class CronRunnerTestCase(unittest.TestCase):
         info_messages = [call.args[0] for call in mock_info.call_args_list]
         self.assertTrue(any("开始扫描 | 账号 tester | 分类 手办 | 模式 CUR | 第 1 页" in message for message in info_messages))
         self.assertTrue(any("扫描完成 | 分类 手办 | 模式 CUR | 第 1 页 | 2 条 | 新增 1 条" in message for message in info_messages))
+        self.assertTrue(any("扫描完成 | 分类 手办 | 模式 CUR | 第 1 页 | 2 条 | 新增 1 条" in message and "| 耗时 API " in message and "| DB " in message for message in info_messages))
         self.assertTrue(any("下次扫描 | 分类 手办 | 第 1 页" in message for message in info_messages))
 
     @patch("bsm.notify.load_notifier")
