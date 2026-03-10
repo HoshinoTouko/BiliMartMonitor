@@ -27,6 +27,8 @@ interface Settings {
     bili_session_pick_mode: string;
     bili_session_cooldown_seconds: number;
     admin_scan_summary_interval_seconds: number;
+    api_request_mode: "sync" | "async";
+    scan_timeout_seconds: number;
     admin_telegram_ids: string[];
     price_filters: string[];
     discount_filters: string[];
@@ -124,7 +126,7 @@ export default function SystemSettingsPage() {
 
     // Editable fields
     const [scanMode, setScanMode] = useState("latest");
-    const [interval, setInterval] = useState(20);
+    const [intervalText, setIntervalText] = useState("20");
     const [category, setCategory] = useState("");
     const [timezone, setTimezone] = useState("Asia/Shanghai");
     const [appBaseUrl, setAppBaseUrl] = useState("");
@@ -134,8 +136,10 @@ export default function SystemSettingsPage() {
     const [cloudflareTurnstileSecretKey, setCloudflareTurnstileSecretKey] = useState("");
     const [clearCloudflareTurnstileSecretKey, setClearCloudflareTurnstileSecretKey] = useState(false);
     const [biliSessionPickMode, setBiliSessionPickMode] = useState("round_robin");
-    const [biliSessionCooldownSeconds, setBiliSessionCooldownSeconds] = useState(60);
-    const [adminScanSummaryIntervalSeconds, setAdminScanSummaryIntervalSeconds] = useState(600);
+    const [biliSessionCooldownSecondsText, setBiliSessionCooldownSecondsText] = useState("60");
+    const [adminScanSummaryIntervalSecondsText, setAdminScanSummaryIntervalSecondsText] = useState("600");
+    const [apiRequestMode, setApiRequestMode] = useState<"sync" | "async">("async");
+    const [scanTimeoutSecondsText, setScanTimeoutSecondsText] = useState("15");
     const [adminTelegramIdsText, setAdminTelegramIdsText] = useState("");
     const [priceFilters, setPriceFilters] = useState<string[]>([]);
     const [discountFilters, setDiscountFilters] = useState<string[]>([]);
@@ -146,7 +150,7 @@ export default function SystemSettingsPage() {
             setSettings(data);
             setCron(data.cron);
             setScanMode(data.scan_mode);
-            setInterval(data.interval);
+            setIntervalText(String(data.interval ?? 20));
             setCategory(data.category);
             setTimezone(data.timezone);
             setAppBaseUrl(data.app_base_url || "");
@@ -156,8 +160,10 @@ export default function SystemSettingsPage() {
             setCloudflareTurnstileSecretKey("");
             setClearCloudflareTurnstileSecretKey(false);
             setBiliSessionPickMode(data.bili_session_pick_mode || "round_robin");
-            setBiliSessionCooldownSeconds(data.bili_session_cooldown_seconds ?? 60);
-            setAdminScanSummaryIntervalSeconds(data.admin_scan_summary_interval_seconds ?? 600);
+            setBiliSessionCooldownSecondsText(String(data.bili_session_cooldown_seconds ?? 60));
+            setAdminScanSummaryIntervalSecondsText(String(data.admin_scan_summary_interval_seconds ?? 600));
+            setApiRequestMode((data.api_request_mode ?? "async") === "sync" ? "sync" : "async");
+            setScanTimeoutSecondsText(String(data.scan_timeout_seconds ?? 15));
             setAdminTelegramIdsText((data.admin_telegram_ids || []).join("\n"));
             setPriceFilters(data.price_filters || []);
             setDiscountFilters(data.discount_filters || []);
@@ -248,6 +254,27 @@ export default function SystemSettingsPage() {
         setSaving(true);
         setSaveMsg("");
         try {
+            const interval = Number(intervalText.trim());
+            const biliSessionCooldownSeconds = Number(biliSessionCooldownSecondsText.trim());
+            const adminScanSummaryIntervalSeconds = Number(adminScanSummaryIntervalSecondsText.trim());
+            const scanTimeoutSeconds = Number(scanTimeoutSecondsText.trim());
+            if (!Number.isFinite(interval) || interval < 5) {
+                setSaveMsg("❌ 扫描间隔必须 >= 5 秒");
+                return;
+            }
+            if (!Number.isFinite(biliSessionCooldownSeconds) || biliSessionCooldownSeconds < 0) {
+                setSaveMsg("❌ BiliSession 冷却期必须 >= 0");
+                return;
+            }
+            if (!Number.isFinite(adminScanSummaryIntervalSeconds) || adminScanSummaryIntervalSeconds <= 0) {
+                setSaveMsg("❌ 管理员扫描汇总推送周期必须 > 0");
+                return;
+            }
+            if (!Number.isFinite(scanTimeoutSeconds) || scanTimeoutSeconds <= 0) {
+                setSaveMsg("❌ API 超时必须 > 0");
+                return;
+            }
+
             const payload: Record<string, unknown> = {
                 scan_mode: scanMode,
                 interval,
@@ -259,6 +286,8 @@ export default function SystemSettingsPage() {
                 bili_session_pick_mode: biliSessionPickMode,
                 bili_session_cooldown_seconds: biliSessionCooldownSeconds,
                 admin_scan_summary_interval_seconds: adminScanSummaryIntervalSeconds,
+                api_request_mode: apiRequestMode,
+                scan_timeout_seconds: scanTimeoutSeconds,
                 admin_telegram_ids: adminTelegramIdsText.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean),
                 price_filters: priceFilters,
                 discount_filters: discountFilters,
@@ -436,11 +465,57 @@ export default function SystemSettingsPage() {
                                 <input
                                     type="number" min={5} max={3600}
                                     className="bsm-input" style={{ width: "120px" }}
-                                    value={interval}
-                                    onChange={(e) => setInterval(Number(e.target.value))}
+                                    value={intervalText}
+                                    onChange={(e) => setIntervalText(e.target.value)}
+                                    onWheel={(e) => e.currentTarget.blur()}
                                 />
                                 <span className="bsm-text-muted" style={{ marginLeft: "0.5rem", fontSize: "0.8125rem" }}>
                                     最小 5 秒
+                                </span>
+                            </div>
+                        </div>
+
+                        <div className="bsm-settings-row">
+                            <label className="bsm-settings-label">API 请求模式</label>
+                            <div className="bsm-settings-control">
+                                <label className="bsm-settings-radio">
+                                    <input
+                                        type="radio"
+                                        name="api_request_mode"
+                                        value="async"
+                                        checked={apiRequestMode === "async"}
+                                        onChange={() => setApiRequestMode("async")}
+                                    />
+                                    <span>async（默认）</span>
+                                </label>
+                                <label className="bsm-settings-radio">
+                                    <input
+                                        type="radio"
+                                        name="api_request_mode"
+                                        value="sync"
+                                        checked={apiRequestMode === "sync"}
+                                        onChange={() => setApiRequestMode("sync")}
+                                    />
+                                    <span>sync</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div className="bsm-settings-row">
+                            <label className="bsm-settings-label">API 超时（秒）</label>
+                            <div className="bsm-settings-control">
+                                <input
+                                    type="number"
+                                    min={1}
+                                    max={120}
+                                    className="bsm-input"
+                                    style={{ width: "120px" }}
+                                    value={scanTimeoutSecondsText}
+                                    onChange={(e) => setScanTimeoutSecondsText(e.target.value)}
+                                    onWheel={(e) => e.currentTarget.blur()}
+                                />
+                                <span className="bsm-text-muted" style={{ marginLeft: "0.5rem", fontSize: "0.8125rem" }}>
+                                    默认 15 秒
                                 </span>
                             </div>
                         </div>
@@ -621,8 +696,9 @@ export default function SystemSettingsPage() {
                                     max={3600}
                                     className="bsm-input"
                                     style={{ width: "120px" }}
-                                    value={biliSessionCooldownSeconds}
-                                    onChange={(e) => setBiliSessionCooldownSeconds(Number(e.target.value))}
+                                    value={biliSessionCooldownSecondsText}
+                                    onChange={(e) => setBiliSessionCooldownSecondsText(e.target.value)}
+                                    onWheel={(e) => e.currentTarget.blur()}
                                 />
                                 <span className="bsm-text-muted" style={{ marginLeft: "0.5rem", fontSize: "0.8125rem" }}>
                                     某个 Session 报错后，在冷却期内不会被再次选中；0 表示关闭
@@ -639,8 +715,9 @@ export default function SystemSettingsPage() {
                                     max={86400}
                                     className="bsm-input"
                                     style={{ width: "120px" }}
-                                    value={adminScanSummaryIntervalSeconds}
-                                    onChange={(e) => setAdminScanSummaryIntervalSeconds(Number(e.target.value))}
+                                    value={adminScanSummaryIntervalSecondsText}
+                                    onChange={(e) => setAdminScanSummaryIntervalSecondsText(e.target.value)}
+                                    onWheel={(e) => e.currentTarget.blur()}
                                 />
                                 <span className="bsm-text-muted" style={{ marginLeft: "0.5rem", fontSize: "0.8125rem" }}>
                                     默认 600 秒；按该周期向 Admin Telegram 推送分类扫描汇总

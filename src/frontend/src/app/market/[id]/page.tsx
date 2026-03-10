@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import Shell from "@/components/Shell";
@@ -92,6 +92,8 @@ interface ChartDotShapeProps {
     payload?: ChartDataPoint;
 }
 
+const ESTIMATE_POINTS_LIMIT = 200;
+
 function timeAgo(dt: string | number | null): string {
     return timeAgoFromApiDate(dt, "—");
 }
@@ -151,11 +153,13 @@ export default function MarketItemDetailPage() {
     const [error, setError] = useState("");
     const [isZoomed, setIsZoomed] = useState(false);
     const [zoomedImgUrl, setZoomedImgUrl] = useState<string | null>(null);
-    const [zoomRect, setZoomRect] = useState<DOMRect | null>(null);
     const [refreshing, setRefreshing] = useState(false);
     const [refreshingListings, setRefreshingListings] = useState(false);
     const [refreshProgress, setRefreshProgress] = useState(0);
     const [inFlightIds, setInFlightIds] = useState<number[]>([]);
+    const [pageInput, setPageInput] = useState("1");
+    const [pageJumpOpen, setPageJumpOpen] = useState(false);
+    const shouldScrollAfterListingsLoadRef = useRef(false);
 
     useEffect(() => {
         if (!id) return;
@@ -194,7 +198,7 @@ export default function MarketItemDetailPage() {
             const data = await apiPost(`/api/market/items/${id}/refresh`, {}) as { item?: MarketItem };
             if (data?.item) {
                 setItem(data.item);
-                // toast could be added here
+                window.scrollTo({ top: 0, behavior: "smooth" });
             }
         } catch (e: unknown) {
             setError(e instanceof Error ? e.message : "刷新失败");
@@ -211,6 +215,10 @@ export default function MarketItemDetailPage() {
                 const data = await apiGet(`/api/market/items/${id}/recent-listings?page=${page}&limit=20&sort_by=${sortBy}`) as { listings?: RecentListing[], total_pages?: number };
                 setRecentListings(data.listings ?? []);
                 setTotalPages(data.total_pages ?? 1);
+                if (shouldScrollAfterListingsLoadRef.current) {
+                    window.scrollTo({ top: 0, behavior: "smooth" });
+                    shouldScrollAfterListingsLoadRef.current = false;
+                }
             } catch (e) {
                 console.error("Failed to load listings", e);
             } finally {
@@ -220,8 +228,13 @@ export default function MarketItemDetailPage() {
         loadListings();
     }, [id, page, sortBy]);
 
+    useEffect(() => {
+        setPageInput(String(page));
+    }, [page]);
+
     const chartData = history
         .filter((h) => h.price != null)
+        .slice(-ESTIMATE_POINTS_LIMIT)
         .map((h) => ({
             time: formatDate(h.recorded_at),
             price: h.price as number,
@@ -400,8 +413,7 @@ export default function MarketItemDetailPage() {
                                             alt={item.name ?? ""}
                                             className="bsm-detail-img"
                                             referrerPolicy="no-referrer"
-                                            onClick={(e) => {
-                                                setZoomRect(e.currentTarget.getBoundingClientRect());
+                                            onClick={() => {
                                                 setZoomedImgUrl(item.img_url);
                                                 setIsZoomed(true);
                                             }}
@@ -586,7 +598,6 @@ export default function MarketItemDetailPage() {
                                                             onClick={(e) => {
                                                                 e.preventDefault();
                                                                 e.stopPropagation();
-                                                                setZoomRect(e.currentTarget.getBoundingClientRect());
                                                                 setZoomedImgUrl(imgSrc);
                                                                 setIsZoomed(true);
                                                             }}
@@ -648,6 +659,7 @@ export default function MarketItemDetailPage() {
                                     value={sortBy}
                                     onChange={(e) => {
                                         setSortBy(e.target.value);
+                                        shouldScrollAfterListingsLoadRef.current = true;
                                         setPage(1);
                                     }}
                                     style={{ width: "auto" }}
@@ -709,6 +721,7 @@ export default function MarketItemDetailPage() {
 
                                         try {
                                             await Promise.all(chunks.map(c => refreshChunk(c)));
+                                            window.scrollTo({ top: 0, behavior: "smooth" });
                                         } finally {
                                             setRefreshingListings(false);
                                             setRefreshProgress(0);
@@ -794,7 +807,7 @@ export default function MarketItemDetailPage() {
                                                         >
                                                             {imgSrc ? (
                                                                 // eslint-disable-next-line @next/next/no-img-element
-                                                                <img src={imgSrc} alt={b_item.name} className="bsm-bundle-img" referrerPolicy="no-referrer" style={{ cursor: "zoom-in" }} onClick={(e) => { e.preventDefault(); e.stopPropagation(); setZoomRect(e.currentTarget.getBoundingClientRect()); setZoomedImgUrl(imgSrc); setIsZoomed(true); }} onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
+                                                                <img src={imgSrc} alt={b_item.name} className="bsm-bundle-img" referrerPolicy="no-referrer" style={{ cursor: "zoom-in" }} onClick={(e) => { e.preventDefault(); e.stopPropagation(); setZoomedImgUrl(imgSrc); setIsZoomed(true); }} onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
                                                             ) : (
                                                                 <span style={{ fontSize: '1.2rem' }}>📦</span>
                                                             )}
@@ -812,7 +825,10 @@ export default function MarketItemDetailPage() {
                                 <button
                                     className="bsm-btn bsm-btn-outline bsm-btn-sm"
                                     disabled={page <= 1}
-                                    onClick={() => setPage(p => p - 1)}>
+                                    onClick={() => {
+                                        shouldScrollAfterListingsLoadRef.current = true;
+                                        setPage(p => p - 1);
+                                    }}>
                                     上一页
                                 </button>
                                 <span style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
@@ -821,9 +837,76 @@ export default function MarketItemDetailPage() {
                                 <button
                                     className="bsm-btn bsm-btn-outline bsm-btn-sm"
                                     disabled={page >= totalPages}
-                                    onClick={() => setPage(p => p + 1)}>
+                                    onClick={() => {
+                                        shouldScrollAfterListingsLoadRef.current = true;
+                                        setPage(p => p + 1);
+                                    }}>
                                     下一页
                                 </button>
+                                <div className="bsm-page-jump">
+                                    {!pageJumpOpen ? (
+                                        <button
+                                            className="bsm-btn bsm-btn-outline bsm-btn-sm"
+                                            onClick={() => setPageJumpOpen(true)}
+                                        >
+                                            跳页
+                                        </button>
+                                    ) : (
+                                        <>
+                                            <input
+                                                className="bsm-input bsm-input-sm"
+                                                type="number"
+                                                min={1}
+                                                max={Math.max(1, totalPages)}
+                                                value={pageInput}
+                                                onChange={(e) => setPageInput(e.target.value)}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === "Enter") {
+                                                        e.preventDefault();
+                                                        const parsed = Number.parseInt(pageInput, 10);
+                                                        if (!Number.isFinite(parsed)) {
+                                                            setPageInput(String(page));
+                                                            return;
+                                                        }
+                                                        const target = Math.min(Math.max(1, parsed), Math.max(1, totalPages));
+                                                        setPageInput(String(target));
+                                                        if (target !== page) {
+                                                            shouldScrollAfterListingsLoadRef.current = true;
+                                                            setPage(target);
+                                                        }
+                                                        setPageJumpOpen(false);
+                                                    }
+                                                    if (e.key === "Escape") {
+                                                        e.preventDefault();
+                                                        setPageInput(String(page));
+                                                        setPageJumpOpen(false);
+                                                    }
+                                                }}
+                                                style={{ width: "84px" }}
+                                                autoFocus
+                                            />
+                                            <button
+                                                className="bsm-btn bsm-btn-outline bsm-btn-sm"
+                                                onClick={() => {
+                                                    const parsed = Number.parseInt(pageInput, 10);
+                                                    if (!Number.isFinite(parsed)) {
+                                                        setPageInput(String(page));
+                                                        return;
+                                                    }
+                                                    const target = Math.min(Math.max(1, parsed), Math.max(1, totalPages));
+                                                    setPageInput(String(target));
+                                                    if (target !== page) {
+                                                        shouldScrollAfterListingsLoadRef.current = true;
+                                                        setPage(target);
+                                                    }
+                                                    setPageJumpOpen(false);
+                                                }}
+                                            >
+                                                前往
+                                            </button>
+                                        </>
+                                    )}
+                                </div>
                             </div>
                         )}
                     </div>
@@ -846,7 +929,7 @@ export default function MarketItemDetailPage() {
                             alignItems: 'center',
                             justifyContent: 'center',
                             cursor: 'zoom-out',
-                            padding: '2rem'
+                            padding: 'max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left))'
                         }}
                         onClick={() => { setIsZoomed(false); setZoomedImgUrl(null); }}
                     >
@@ -867,16 +950,15 @@ export default function MarketItemDetailPage() {
                             alignItems: 'center',
                             justifyContent: 'center',
                             pointerEvents: 'none',
-                            transformOrigin: zoomRect ? `${zoomRect.left + zoomRect.width / 2}px ${zoomRect.top + zoomRect.height / 2}px` : 'center',
-                            animation: 'bsmZoomFromOrigin 0.3s cubic-bezier(0.16, 1, 0.3, 1)'
+                            animation: 'bsmZoomIn 0.2s cubic-bezier(0.16, 1, 0.3, 1)'
                         }}>
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img
                                 src={zoomedImgUrl || item?.img_url || ""}
                                 alt="Zoomed"
                                 style={{
-                                    maxWidth: '100%',
-                                    maxHeight: '100%',
+                                    maxWidth: 'min(96vw, 1200px)',
+                                    maxHeight: 'min(96dvh, 1200px)',
                                     objectFit: 'contain',
                                     borderRadius: '8px',
                                     boxShadow: '0 10px 40px rgba(0,0,0,0.5)',

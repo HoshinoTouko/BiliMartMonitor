@@ -34,9 +34,24 @@ def _non_negative_int(value: Any, default: int) -> int:
     return parsed if parsed >= 0 else default
 
 
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _session_pick_mode(value: Any, default: str = "round_robin") -> str:
     mode = str(value or default).strip().lower()
     if mode not in {"round_robin", "random"}:
+        return default
+    return mode
+
+
+def _api_request_mode(value: Any, default: str = "async") -> str:
+    mode = str(value or default).strip().lower()
+    if mode not in {"sync", "async"}:
         return default
     return mode
 
@@ -201,6 +216,14 @@ def load_runtime_config() -> Dict[str, Any]:
             yaml_config.get("admin_scan_summary_interval_seconds", 600),
             600,
         ),
+        "api_request_mode": _api_request_mode(
+            yaml_config.get("api_request_mode", "async"),
+            "async",
+        ),
+        "scan_timeout_seconds": _positive_float(
+            yaml_config.get("scan_timeout_seconds", 15),
+            15.0,
+        ),
     }
     cfg["admin_telegram_ids"] = _normalize_string_list(yaml_config.get("admin_telegram_ids"))
     price_filters = yaml_config.get("price_filters")
@@ -253,6 +276,8 @@ def list_runtime_settings() -> Dict[str, Any]:
         "bili_session_pick_mode": cfg.get("bili_session_pick_mode"),
         "bili_session_cooldown_seconds": cfg.get("bili_session_cooldown_seconds"),
         "admin_scan_summary_interval_seconds": cfg.get("admin_scan_summary_interval_seconds"),
+        "api_request_mode": cfg.get("api_request_mode"),
+        "scan_timeout_seconds": cfg.get("scan_timeout_seconds"),
         "admin_telegram_ids": cfg.get("admin_telegram_ids") or [],
         "bot_id": cfg.get("telegram", {}).get("bot_id"),
     }

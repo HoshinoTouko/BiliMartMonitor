@@ -6,6 +6,12 @@ scan_mode: latest
 # 扫描间隔(秒)
 interval: 60
 
+# API 请求模式: async(异步) / sync(同步)
+api_request_mode: async
+
+# 扫描 API 超时(秒)
+scan_timeout_seconds: 15
+
 # 排序方式（默认: 创建时间排序）
 # TIME_DESC: 创建时间排序（新 -> 旧）
 sort_type: TIME_DESC

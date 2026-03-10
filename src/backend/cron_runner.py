@@ -4,11 +4,11 @@ Cron background task — scan loop without Telegram.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,10 +17,10 @@ if _SRC_ROOT not in sys.path:
     sys.path.insert(0, _SRC_ROOT)
 
 from backend.cron_state import cron_state  # noqa: E402
-
+ 
 _CONTINUE_MAX_PAGES = 50
 _CUR_MAX_PAGES = 50
-_SCAN_TIMEOUT_SECONDS = 30
+_SCAN_TIMEOUT_SECONDS = 15
 _ADMIN_SCAN_SUMMARY_INTERVAL_SECONDS = 600.0
 _SCAN_CATEGORY_INDEX = 0
 _CATEGORY_SCAN_STATE: dict[str, dict[str, int | str | None]] = {}
@@ -35,6 +35,14 @@ _CATEGORY_LABELS = {
 }
 _SCAN_NOW_EVENT: asyncio.Event | None = None
 _CRON_LOOP: asyncio.AbstractEventLoop | None = None
+_FINALIZE_RESULT_QUEUE: asyncio.Queue[dict[str, object]] | None = None
+_FINALIZE_TASKS: set[asyncio.Task[None]] = set()
+_BLOB_WRITE_TASKS: set[asyncio.Task[None]] = set()
+_BLOB_WRITE_SEMAPHORE: asyncio.Semaphore | None = None
+_BLOB_WRITE_MAX_CONCURRENCY = 10
+_BLOB_ALERT_THRESHOLD = 8
+_BLOB_ALERT_ACTIVE = False
+_BLOB_RUNNING_COUNT = 0
 _SCAN_PROGRESS_LOADED = False
 _WAIT_PREFIX = "[WAIT]"
 _EXEC_PREFIX = "[EXEC]"
@@ -62,6 +70,25 @@ def _mode_log_label(mode: str) -> str:
     if mode == "continue_until_repeat":
         return "CUR"
     return mode
+
+
+def _new_trace_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _cleanup_blob_write_tasks() -> None:
+    global _BLOB_ALERT_ACTIVE
+    done_tasks = [task for task in _BLOB_WRITE_TASKS if task.done()]
+    for task in done_tasks:
+        _BLOB_WRITE_TASKS.discard(task)
+        try:
+            exc = task.exception()
+        except Exception:
+            exc = None
+        if exc is not None:
+            _log_exec(f"BLOB后台写入任务异常: {exc}", level="error")
+    if _BLOB_RUNNING_COUNT < _BLOB_ALERT_THRESHOLD:
+        _BLOB_ALERT_ACTIVE = False
 
 
 def _normalize_categories(raw_category: str | None) -> list[str | None]:
@@ -239,6 +266,20 @@ def _max_pages_for_mode(mode: str) -> int:
     return _CONTINUE_MAX_PAGES
 
 
+def _collect_finalize_results(
+    queue: asyncio.Queue[dict[str, object]] | None,
+) -> list[dict[str, object]]:
+    if queue is None:
+        return []
+    results: list[dict[str, object]] = []
+    while True:
+        try:
+            results.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    return results
+
+
 def request_scan_now() -> bool:
     if not cron_state.is_running:
         return False
@@ -353,22 +394,36 @@ def _assign_sessions_to_categories(
     return assignments
 
 
-def _run_scan_once() -> dict:
-    """Blocking scan — runs in a thread executor (bsm code is synchronous)."""
+async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
+    """Run one scan round. API stage runs first; DB stage can be deferred."""
+    global _BLOB_WRITE_SEMAPHORE, _BLOB_ALERT_ACTIVE, _BLOB_RUNNING_COUNT
     from bsm.settings import load_runtime_config
     from bsm.db import (
-        filter_new_items,
         list_bili_sessions,
-        save_items,
+        save_items_data_phase,
+        flush_pending_blob_updates,
         record_bili_session_fetch_success,
         mark_bili_session_result,
     )
-    from bsm.scan import scan_once, ScanRateLimitedError
+    from bsm.scan import scan_once, scan_once_async, ScanRateLimitedError
     from bsm.notify import load_notifier, send_admin_telegram_alert
 
-    cfg = load_runtime_config()
-    interval = cfg.get("interval", 20)
-    admin_scan_summary_interval_seconds = int(cfg.get("admin_scan_summary_interval_seconds", _ADMIN_SCAN_SUMMARY_INTERVAL_SECONDS) or _ADMIN_SCAN_SUMMARY_INTERVAL_SECONDS)
+    _cleanup_blob_write_tasks()
+    if _BLOB_WRITE_SEMAPHORE is None:
+        _BLOB_WRITE_SEMAPHORE = asyncio.Semaphore(_BLOB_WRITE_MAX_CONCURRENCY)
+
+    cfg = await asyncio.to_thread(load_runtime_config)
+    interval = float(cfg.get("interval", 20) or 20)
+    api_request_mode = str(cfg.get("api_request_mode", "async") or "async").strip().lower()
+    if api_request_mode not in {"sync", "async"}:
+        api_request_mode = "async"
+    scan_timeout_seconds = float(cfg.get("scan_timeout_seconds", _SCAN_TIMEOUT_SECONDS) or _SCAN_TIMEOUT_SECONDS)
+    if scan_timeout_seconds <= 0:
+        scan_timeout_seconds = float(_SCAN_TIMEOUT_SECONDS)
+    admin_scan_summary_interval_seconds = int(
+        cfg.get("admin_scan_summary_interval_seconds", _ADMIN_SCAN_SUMMARY_INTERVAL_SECONDS)
+        or _ADMIN_SCAN_SUMMARY_INTERVAL_SECONDS
+    )
     if admin_scan_summary_interval_seconds <= 0:
         admin_scan_summary_interval_seconds = int(_ADMIN_SCAN_SUMMARY_INTERVAL_SECONDS)
 
@@ -376,11 +431,15 @@ def _run_scan_once() -> dict:
     categories = _normalize_categories(cfg.get("category"))
     _load_scan_progress()
     cooldown_seconds = int(cfg.get("bili_session_cooldown_seconds", 60) or 60)
-    raw_sessions = list_bili_sessions(status="active")
+    raw_sessions = await asyncio.to_thread(list_bili_sessions, status="active")
     available_sessions = [session for session in raw_sessions if _is_session_available(session, cooldown_seconds)]
     if not available_sessions:
         _log_wait("跳过：无可用 session，请先登录", level="warn")
-        return {"skip": True, "interval": interval, "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds}
+        return {
+            "skip": True,
+            "interval": interval,
+            "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds,
+        }
 
     active_categories: list[str | None] = []
     for category in categories:
@@ -391,89 +450,56 @@ def _run_scan_once() -> dict:
             _log_wait(f"分类 {_category_label(category)} 休眠中，剩余 {remaining} 轮")
 
     if not active_categories:
-        return {"skip": True, "interval": interval, "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds}
+        return {
+            "skip": True,
+            "interval": interval,
+            "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds,
+        }
 
     assignments = _assign_sessions_to_categories(active_categories, available_sessions)
+    assignment_jobs: list[tuple[str | None, dict, str]] = []
     mode_label = _mode_log_label(mode)
     for category, sess in assignments:
+        trace_id = _new_trace_id()
+        assignment_jobs.append((category, sess, trace_id))
         page = _mode_page(mode, category)
         _log_exec(
-            f"开始扫描 | 账号 {str(sess.get('login_username') or '未知')} | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页"
+            f"开始扫描 | 账号 {str(sess.get('login_username') or '未知')} | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | 追踪ID {trace_id}"
         )
 
-    try:
-        continue_like_mode = mode in {"continue", "continue_until_repeat"}
-        category_jobs: list[dict] = []
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(assignments)))
-        try:
-            future_map = {}
-            for category, sess in assignments:
-                state = _get_category_state(category)
-                scan_next_id = state["next_id"] if continue_like_mode else None
-                scan_cfg = dict(cfg)
-                scan_cfg["category"] = category or ""
-                scan_cfg["scan_timeout_seconds"] = _SCAN_TIMEOUT_SECONDS
-                future = executor.submit(scan_once, str(sess.get("cookies") or ""), scan_cfg, scan_next_id)
-                future_map[future] = {
-                    "category": category,
-                    "session": sess,
-                    "page": _mode_page(mode, category),
-                    "started_at": time.perf_counter(),
-                }
-            for future, meta in future_map.items():
-                try:
-                    next_id, items = future.result(timeout=_SCAN_TIMEOUT_SECONDS)
-                    meta["next_id"] = next_id
-                    meta["items"] = items if isinstance(items, list) else []
-                    meta["error"] = None
-                except concurrent.futures.TimeoutError:
-                    meta["error"] = f"扫描超时（>{_SCAN_TIMEOUT_SECONDS}秒）"
-                    meta["items"] = []
-                    meta["next_id"] = None
-                except ScanRateLimitedError as e:
-                    meta["error"] = str(e)
-                    meta["items"] = []
-                    meta["next_id"] = None
-                except Exception as e:
-                    meta["error"] = str(e)
-                    meta["items"] = []
-                    meta["next_id"] = None
-                meta["duration_ms"] = int((time.perf_counter() - float(meta.get("started_at") or time.perf_counter())) * 1000)
-                category_jobs.append(meta)
-        finally:
-            executor.shutdown(wait=True, cancel_futures=True)
-
-        db_futures: dict[concurrent.futures.Future[dict[str, object]], dict[str, object]] = {}
+    async def _finalize_scan_round(category_jobs: list[dict[str, object]]) -> dict[str, object]:
         db_results: dict[tuple[str | None, int], dict[str, object]] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(category_jobs))) as db_executor:
-            for job in category_jobs:
-                if str(job.get("error") or "").strip():
-                    continue
+        db_tasks: list[asyncio.Task[tuple[tuple[str | None, int], dict[str, object]]]] = []
 
-                items = list(job.get("items") or [])
+        async def _run_db_pipeline_for_job(job: dict[str, object]) -> tuple[tuple[str | None, int], dict[str, object]]:
+            category = job.get("category")
+            page = int(job.get("page") or 0)
+            items = list(job.get("items") or [])
 
-                def _run_db_pipeline(job_items: list[dict]) -> dict[str, object]:
-                    db_started_at = time.perf_counter()
-                    new_items = filter_new_items(job_items)
-                    saved, inserted = save_items(job_items)
-                    db_duration_ms = int((time.perf_counter() - db_started_at) * 1000)
-                    return {
-                        "new_items": new_items,
-                        "saved": int(saved),
-                        "inserted": int(inserted),
-                        "db_duration_ms": db_duration_ms,
-                    }
-
-                future = db_executor.submit(_run_db_pipeline, items)
-                db_futures[future] = {
-                    "category": job.get("category"),
-                    "page": int(job.get("page") or 0),
+            def _run_db_pipeline() -> dict[str, object]:
+                save_result = save_items_data_phase(items)
+                return {
+                    "new_items": list(save_result.get("new_items") or []),
+                    "saved": int(save_result.get("saved") or 0),
+                    "inserted": int(save_result.get("inserted") or 0),
+                    "db_duration_ms": int(save_result.get("data_write_ms") or 0),
+                    "blob_write_count": int(save_result.get("blob_write_count") or 0),
+                    "pending_blob_updates": list(save_result.get("pending_blob_updates") or []),
+                    "blob_backend_name": str(save_result.get("backend_name") or ""),
+                    "blob_is_cloudflare": bool(save_result.get("is_cloudflare") is True),
                 }
 
-            for future, meta in db_futures.items():
-                category_key = meta.get("category")
-                page_key = int(meta.get("page") or 0)
-                db_results[(category_key, page_key)] = future.result()
+            result = await asyncio.to_thread(_run_db_pipeline)
+            return (category, page), result
+
+        for job in category_jobs:
+            if str(job.get("error") or "").strip():
+                continue
+            db_tasks.append(asyncio.create_task(_run_db_pipeline_for_job(job)))
+
+        if db_tasks:
+            for key, result in await asyncio.gather(*db_tasks):
+                db_results[key] = result
 
         total_count = 0
         total_saved = 0
@@ -484,11 +510,13 @@ def _run_scan_once() -> dict:
         session_success_count: dict[str, int] = {}
         session_errors: dict[str, str] = {}
         max_pages = _max_pages_for_mode(mode)
+        continue_like_mode = mode in {"continue", "continue_until_repeat"}
 
         for job in category_jobs:
             category = job["category"]
             page = int(job["page"])
             session = job["session"]
+            trace_id = str(job.get("trace_id") or "-")
             username = str(session.get("login_username") or "")
             error = str(job.get("error") or "").strip()
             duration_ms = int(job.get("duration_ms") or 0)
@@ -496,11 +524,12 @@ def _run_scan_once() -> dict:
                 any_error = any_error or error
                 session_errors[username] = error
                 _log_exec(
-                    f"扫描出错 | 账号 {username or '未知'} | 分类 {_category_label(category)} | 耗时 {duration_ms} ms | {error}",
+                    f"扫描出错 | 账号 {username or '未知'} | 分类 {_category_label(category)} | 耗时 {duration_ms} ms | {error} | 追踪ID {trace_id}",
                     level="error",
                 )
-                send_admin_telegram_alert(
-                    f"系统告警\n类型: 扫描异常\n账号: {username or '未知'}\n分类: {_category_label(category)}\n详情: {error}",
+                await asyncio.to_thread(
+                    send_admin_telegram_alert,
+                    f"系统告警\n类型: 扫描异常\n账号: {username or '未知'}\n分类: {_category_label(category)}\n追踪ID: {trace_id}\n详情: {error}",
                     cfg,
                 )
                 continue
@@ -512,11 +541,72 @@ def _run_scan_once() -> dict:
             saved = int(db_result.get("saved") or 0)
             inserted = int(db_result.get("inserted") or 0)
             db_duration_ms = int(db_result.get("db_duration_ms") or 0)
+            blob_write_count = int(db_result.get("blob_write_count") or 0)
             total_duration_ms = duration_ms + db_duration_ms
             total_count += len(items)
             total_saved += saved
             total_inserted += inserted
             notify_items.extend(new_items)
+
+            pending_blob_updates = list(db_result.get("pending_blob_updates") or [])
+            if pending_blob_updates:
+                blob_backend_name = str(db_result.get("blob_backend_name") or "unknown")
+                blob_is_cloudflare = bool(db_result.get("blob_is_cloudflare") is True)
+
+                async def _run_blob_write(
+                    category_value: str | None,
+                    page_value: int,
+                    trace_id_value: str,
+                    updates: list[tuple[int, bytes, str]],
+                    backend_name_value: str,
+                    is_cloudflare_value: bool,
+                ) -> None:
+                    global _BLOB_RUNNING_COUNT, _BLOB_ALERT_ACTIVE
+                    assert _BLOB_WRITE_SEMAPHORE is not None
+                    async with _BLOB_WRITE_SEMAPHORE:
+                        _BLOB_RUNNING_COUNT += 1
+                        running_now = _BLOB_RUNNING_COUNT
+                        if running_now >= _BLOB_ALERT_THRESHOLD and not _BLOB_ALERT_ACTIVE:
+                            _BLOB_ALERT_ACTIVE = True
+                            warn_message = (
+                                "系统告警\n"
+                                "类型: BLOB写入并发预警\n"
+                                f"详情: 当前并发任务 {running_now}/{_BLOB_WRITE_MAX_CONCURRENCY}，阈值 {_BLOB_ALERT_THRESHOLD}"
+                            )
+                            asyncio.create_task(asyncio.to_thread(send_admin_telegram_alert, warn_message, cfg))
+                            _log_exec(
+                                f"BLOB并发达到告警阈值 | 当前并发任务 {running_now}/{_BLOB_WRITE_MAX_CONCURRENCY}",
+                                level="warn",
+                            )
+                        try:
+                            blob_result = await asyncio.to_thread(
+                                flush_pending_blob_updates,
+                                updates,
+                                is_cloudflare=is_cloudflare_value,
+                                backend_name=backend_name_value,
+                            )
+                            _log_exec(
+                                f"BLOB写入完成 | 分类 {_category_label(category_value)} | 第 {page_value} 页 | 条数 {int(blob_result.get('blob_write_count') or 0)} | 耗时 {int(blob_result.get('blob_write_ms') or 0)} ms | 追踪ID {trace_id_value}"
+                            )
+                        finally:
+                            _BLOB_RUNNING_COUNT = max(0, _BLOB_RUNNING_COUNT - 1)
+
+                blob_task = asyncio.create_task(
+                    _run_blob_write(
+                        category,
+                        page,
+                        trace_id,
+                        pending_blob_updates,
+                        blob_backend_name,
+                        blob_is_cloudflare,
+                    )
+                )
+                _BLOB_WRITE_TASKS.add(blob_task)
+                blob_task.add_done_callback(lambda t: _BLOB_WRITE_TASKS.discard(t))
+                blob_queued = len(_BLOB_WRITE_TASKS)
+                _log_exec(
+                    f"BLOB写入已排队 | 分类 {_category_label(category)} | 第 {page} 页 | 条数 {blob_write_count} | 队列任务 {blob_queued} | 运行并发 {_BLOB_RUNNING_COUNT}/{_BLOB_WRITE_MAX_CONCURRENCY} | 追踪ID {trace_id}"
+                )
 
             should_reset_on_repeat = mode == "continue_until_repeat" and len(new_items) < len(items)
             did_reset_cursor = False
@@ -546,11 +636,13 @@ def _run_scan_once() -> dict:
                 "duration_ms": total_duration_ms,
                 "request_duration_ms": duration_ms,
                 "db_duration_ms": db_duration_ms,
+                "blob_write_count": blob_write_count,
+                "trace_id": trace_id,
             })
             _log_exec(
-                f"扫描完成 | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | {len(items)} 条 | 新增 {inserted} 条 | 耗时 API {duration_ms} ms | DB {db_duration_ms} ms"
+                f"扫描完成 | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | {len(items)} 条 | 新增 {inserted} 条 | 耗时 API {duration_ms} ms | DB {db_duration_ms} ms | 追踪ID {trace_id}"
             )
-            _log_wait(f"下次扫描 | 分类 {_category_label(category)} | 第 {_mode_page(mode, category)} 页")
+            _log_wait(f"下次扫描 | 分类 {_category_label(category)} | 第 {_mode_page(mode, category)} 页 | 追踪ID {trace_id}")
             if username and username not in session_errors:
                 session_success_count[username] = session_success_count.get(username, 0) + len(items)
 
@@ -559,16 +651,15 @@ def _run_scan_once() -> dict:
         for username, fetched_count in session_success_count.items():
             if username in session_errors:
                 continue
-            record_bili_session_fetch_success(username, fetched_count=fetched_count)
-            mark_bili_session_result(username, None)
+            await asyncio.to_thread(record_bili_session_fetch_success, username, fetched_count=fetched_count)
+            await asyncio.to_thread(mark_bili_session_result, username, None)
         for username, error in session_errors.items():
             if username:
-                mark_bili_session_result(username, error)
+                await asyncio.to_thread(mark_bili_session_result, username, error)
 
-        # Notify (non-Telegram)
         try:
-            notifier = load_notifier(cfg.get("notify"))
-            notifier.notify_batch(notify_items, cfg, set())
+            notifier = await asyncio.to_thread(load_notifier, cfg.get("notify"))
+            await asyncio.to_thread(notifier.notify_batch, notify_items, cfg, set())
         except Exception as ne:
             _log_exec(f"通知发送失败: {ne}", level="warn")
 
@@ -582,9 +673,64 @@ def _run_scan_once() -> dict:
             "error": any_error,
             "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds,
         }
+
+    try:
+        async def _run_scan_job(category: str | None, sess: dict, trace_id: str) -> dict[str, object]:
+            state = _get_category_state(category)
+            scan_next_id = state["next_id"] if mode in {"continue", "continue_until_repeat"} else None
+            scan_cfg = dict(cfg)
+            scan_cfg["category"] = category or ""
+            scan_cfg["scan_timeout_seconds"] = scan_timeout_seconds
+            started_at = time.perf_counter()
+            meta: dict[str, object] = {
+                "category": category,
+                "session": sess,
+                "page": _mode_page(mode, category),
+                "next_id": None,
+                "items": [],
+                "error": None,
+                "trace_id": trace_id,
+            }
+            try:
+                if api_request_mode == "sync":
+                    scan_coro = asyncio.to_thread(scan_once, str(sess.get("cookies") or ""), scan_cfg, scan_next_id)
+                else:
+                    scan_coro = scan_once_async(str(sess.get("cookies") or ""), scan_cfg, scan_next_id)
+                next_id, items = await asyncio.wait_for(scan_coro, timeout=scan_timeout_seconds)
+                meta["next_id"] = next_id
+                meta["items"] = items if isinstance(items, list) else []
+            except asyncio.TimeoutError:
+                meta["error"] = f"扫描超时（>{scan_timeout_seconds}秒）"
+            except ScanRateLimitedError as e:
+                meta["error"] = str(e)
+            except Exception as e:
+                meta["error"] = str(e)
+            meta["duration_ms"] = int((time.perf_counter() - started_at) * 1000)
+            return meta
+
+        scan_tasks = [asyncio.create_task(_run_scan_job(category, sess, trace_id)) for category, sess, trace_id in assignment_jobs]
+        category_jobs = await asyncio.gather(*scan_tasks)
+
+        if defer_db_finalize:
+            async def _finalize_and_publish() -> None:
+                result = await _finalize_scan_round(category_jobs)
+                if _FINALIZE_RESULT_QUEUE is not None:
+                    await _FINALIZE_RESULT_QUEUE.put(result)
+
+            task = asyncio.create_task(_finalize_and_publish())
+            _FINALIZE_TASKS.add(task)
+            task.add_done_callback(lambda t: _FINALIZE_TASKS.discard(t))
+            return {
+                "skip": False,
+                "deferred": True,
+                "interval": interval,
+                "admin_scan_summary_interval_seconds": admin_scan_summary_interval_seconds,
+            }
+
+        return await _finalize_scan_round(category_jobs)
     except Exception as e:
         _log_exec(f"扫描出错: {e}", level="error")
-        send_admin_telegram_alert(f"系统告警\n类型: 扫描异常\n详情: {e}", cfg)
+        await asyncio.to_thread(send_admin_telegram_alert, f"系统告警\n类型: 扫描异常\n详情: {e}", cfg)
         return {
             "skip": False,
             "count": 0,
@@ -596,13 +742,33 @@ def _run_scan_once() -> dict:
         }
 
 
+def _apply_scan_result(
+    result: dict[str, object],
+    bucket: dict[str, dict[str, int | str]],
+) -> None:
+    if result.get("skip") or result.get("deferred"):
+        return
+    cron_state.update_scan(
+        count=result.get("count", 0),
+        saved=result.get("saved", 0),
+        inserted=result.get("inserted", 0),
+        error=result.get("error"),
+    )
+    summary_rows = result.get("summary_rows") or []
+    if isinstance(summary_rows, list):
+        for row in summary_rows:
+            if isinstance(row, dict):
+                _accumulate_admin_scan_summary(bucket, row)
+
+
 async def cron_loop() -> None:
     """Async cron loop — runs forever until cancelled."""
-    global _CRON_LOOP, _SCAN_NOW_EVENT
+    global _CRON_LOOP, _SCAN_NOW_EVENT, _FINALIZE_RESULT_QUEUE, _BLOB_WRITE_SEMAPHORE, _BLOB_ALERT_ACTIVE, _BLOB_RUNNING_COUNT
 
     cron_state.is_running = True
     _CRON_LOOP = asyncio.get_running_loop()
     _SCAN_NOW_EVENT = asyncio.Event()
+    _FINALIZE_RESULT_QUEUE = asyncio.Queue()
     _load_scan_progress()
     admin_summary_interval_seconds = _ADMIN_SCAN_SUMMARY_INTERVAL_SECONDS
     next_admin_summary_at = _CRON_LOOP.time() + admin_summary_interval_seconds
@@ -610,33 +776,25 @@ async def cron_loop() -> None:
     _log_wait("后台扫描任务已启动")
 
     while True:
+        for finalized in _collect_finalize_results(_FINALIZE_RESULT_QUEUE):
+            _apply_scan_result(finalized, admin_summary_bucket)
+
         cron_state.set_next_scan_in(None)
+        dispatch_started_at = _CRON_LOOP.time()
         try:
-            result = await _CRON_LOOP.run_in_executor(None, _run_scan_once)
+            result = await _run_scan_once()
         except asyncio.CancelledError:
             break
         except Exception as e:
             _log_exec(f"未预期错误: {e}", level="error")
             try:
                 from bsm.notify import send_admin_telegram_alert
-                send_admin_telegram_alert(f"系统告警\n类型: 后台任务异常\n详情: {e}")
+                await asyncio.to_thread(send_admin_telegram_alert, f"系统告警\n类型: 后台任务异常\n详情: {e}")
             except Exception:
                 pass
             result = {"skip": False, "count": 0, "saved": 0,
                       "inserted": 0, "error": str(e), "interval": 20, "admin_scan_summary_interval_seconds": int(admin_summary_interval_seconds)}
-
-        if not result.get("skip"):
-            cron_state.update_scan(
-                count=result.get("count", 0),
-                saved=result.get("saved", 0),
-                inserted=result.get("inserted", 0),
-                error=result.get("error"),
-            )
-            summary_rows = result.get("summary_rows") or []
-            if isinstance(summary_rows, list):
-                for row in summary_rows:
-                    if isinstance(row, dict):
-                        _accumulate_admin_scan_summary(admin_summary_bucket, row)
+        _apply_scan_result(result, admin_summary_bucket)
 
         now = _CRON_LOOP.time()
         configured_admin_interval = float(result.get("admin_scan_summary_interval_seconds", admin_summary_interval_seconds) or admin_summary_interval_seconds)
@@ -651,18 +809,20 @@ async def cron_loop() -> None:
             from bsm.notify import send_admin_telegram_alert
 
             summary_message = _build_admin_scan_summary_message(admin_summary_bucket)
-            sent = send_admin_telegram_alert(summary_message)
+            sent = await asyncio.to_thread(send_admin_telegram_alert, summary_message)
             _log_wait(f"10分钟扫描汇总已推送（{sent}）")
             admin_summary_bucket.clear()
             while next_admin_summary_at <= now:
                 next_admin_summary_at += admin_summary_interval_seconds
 
-        interval = float(result.get("interval", 20))
+        interval = float(result.get("interval", 20) or 20)
         _log_wait(f"等待 {int(interval)} 秒")
 
         try:
-            deadline = _CRON_LOOP.time() + interval
+            deadline = dispatch_started_at + interval
             while True:
+                for finalized in _collect_finalize_results(_FINALIZE_RESULT_QUEUE):
+                    _apply_scan_result(finalized, admin_summary_bucket)
                 remaining = deadline - _CRON_LOOP.time()
                 if remaining <= 0:
                     break
@@ -677,7 +837,18 @@ async def cron_loop() -> None:
         except asyncio.CancelledError:
             break
 
+    if _FINALIZE_TASKS:
+        await asyncio.gather(*list(_FINALIZE_TASKS), return_exceptions=True)
+    if _BLOB_WRITE_TASKS:
+        await asyncio.gather(*list(_BLOB_WRITE_TASKS), return_exceptions=True)
+    for finalized in _collect_finalize_results(_FINALIZE_RESULT_QUEUE):
+        _apply_scan_result(finalized, admin_summary_bucket)
+
     cron_state.is_running = False
     _CRON_LOOP = None
     _SCAN_NOW_EVENT = None
+    _FINALIZE_RESULT_QUEUE = None
+    _BLOB_WRITE_SEMAPHORE = None
+    _BLOB_ALERT_ACTIVE = False
+    _BLOB_RUNNING_COUNT = 0
     _log_wait("后台扫描任务已停止")

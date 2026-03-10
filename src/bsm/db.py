@@ -1,6 +1,7 @@
 import gzip
 import base64
 import json
+import logging
 import os
 import re
 import threading
@@ -37,6 +38,7 @@ _DB_REQUEST_TRACE: ContextVar[Optional[Dict[str, float]]] = ContextVar(
     "bsm_db_request_trace",
     default=None,
 )
+_DB_LOG = logging.getLogger("bsm.db")
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -64,6 +66,13 @@ def _snapshot_now() -> str:
     """Use millisecond precision timestamp in UTC."""
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(now.microsecond / 1000):03d}Z"
+
+
+def _log_blob_write_complete(backend_name: str, count: int) -> None:
+    if count <= 0:
+        return
+    msg = f"BLOB写入完成 | 后端 {backend_name} | 条数 {int(count)}"
+    _DB_LOG.info(msg)
 
 
 def _load_bili_session_runtime_settings() -> Dict[str, Any]:
@@ -1567,23 +1576,29 @@ def prune_orphan_old_market_data() -> Dict[str, Any]:
     return repair_orphan_market_data_batch(limit=2000)
 
 
-def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
+def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     backend = _require_sqlalchemy_backend()
     backend_name = get_db_backend_name()
     is_cloudflare = backend_name == "cloudflare"
     ids = [int(it["c2cItemsId"]) for it in items if it.get("c2cItemsId") is not None]
     inserted = 0
     saved = 0
+    blob_write_count = 0
+    data_write_started_at = time.perf_counter()
+    data_write_ms = 0
 
     with backend.session() as session:
-        existing_rows = {}
+        existing_rows: Dict[int, C2CItem] = {}
         if ids:
-            rows = session.scalars(
-                select(C2CItem).where(C2CItem.c2c_items_id.in_(ids))
-            ).all()
+            rows = session.scalars(select(C2CItem).where(C2CItem.c2c_items_id.in_(ids))).all()
             existing_rows = {int(row.c2c_items_id): row for row in rows}
 
-        pending_detail_blob_updates: List[Tuple[int, str]] = []
+        pending_detail_blob_updates: List[Tuple[int, bytes, str]] = []
+        prepared_items: List[Dict[str, Any]] = []
+        all_product_keys: set[Tuple[int, int, int]] = set()
+        new_rows_payload: List[Dict[str, Any]] = []
+        update_rows_payload: List[Dict[str, Any]] = []
+        new_items_for_notify: List[Dict[str, Any]] = []
 
         for it in items:
             item_id = it.get("c2cItemsId")
@@ -1595,22 +1610,18 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                 continue
 
             try:
-                new_price = it.get("price")
-                timestamp = _now()
                 row = existing_rows.get(item_id)
                 is_new = row is None
-                if row is None:
-                    # Keep a minimal parent row so snapshot FK can be created in this transaction.
-                    row = C2CItem(c2c_items_id=item_id)
-                    session.add(row)
-                    existing_rows[item_id] = row
+                timestamp = _now()
+                new_price = it.get("price")
 
                 detail_list = it.get("detailDtoList", [])
                 if not isinstance(detail_list, list):
                     detail_list = []
                 existing_detail_list: List[Dict[str, Any]] = []
-                if getattr(row, "detail_blob", None):
+                if row is not None and getattr(row, "detail_blob", None):
                     existing_detail_list = _decode_detail_blob(getattr(row, "detail_blob", None))
+
                 materialized_detail_list: List[Dict[str, Any]] = []
                 if "detailDtoList" in it:
                     if detail_list:
@@ -1622,137 +1633,297 @@ def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
                 else:
                     materialized_detail_list = existing_detail_list
 
-                details_snapshot_at = _snapshot_now()
-                total_market_price = 0
-                for d_item in materialized_detail_list:
-                    try:
-                        total_market_price += int(d_item.get("marketPrice", 0) or 0)
-                    except Exception:
-                        continue
-
-                # Write order: product -> snapshot -> c2c_items/blob.
-                item_snapshot_models: List[C2CItemSnapshot] = []
-                for d_item in materialized_detail_list:
-                    d_items_id = d_item.get("itemsId")
-                    if not d_items_id:
-                        continue
-                    try:
-                        parsed_items_id = int(d_items_id)
-                    except Exception:
-                        continue
-                    market_price = d_item.get("marketPrice", 0)
-                    try:
-                        parsed_market_price = int(market_price or 0)
-                    except Exception:
-                        parsed_market_price = 0
-                    parsed_blindbox_id: Optional[int] = None
-                    parsed_sku_id: Optional[int] = None
-                    try:
-                        raw_blindbox = d_item.get("blindBoxId")
-                        if raw_blindbox is not None:
-                            parsed_blindbox_id = int(raw_blindbox)
-                    except Exception:
-                        parsed_blindbox_id = None
-                    try:
-                        raw_sku = d_item.get("skuId")
-                        if raw_sku is not None:
-                            parsed_sku_id = int(raw_sku)
-                    except Exception:
-                        parsed_sku_id = None
-
-                    est_price: Optional[int] = None
-                    if new_price is not None and total_market_price > 0:
-                        try:
-                            est_price = int(float(new_price) * float(parsed_market_price) / float(total_market_price))
-                        except Exception:
-                            est_price = None
-                    if parsed_blindbox_id is None:
-                        parsed_blindbox_id = 0
-                    if parsed_sku_id is None:
-                        parsed_sku_id = 0
-                    existing_product = session.scalar(
-                        select(Product).where(
-                            Product.blindbox_id == parsed_blindbox_id,
-                            Product.items_id == parsed_items_id,
-                            Product.sku_id == parsed_sku_id,
-                        )
-                    )
-                    if existing_product is None:
-                        existing_product = Product(
-                            blindbox_id=parsed_blindbox_id,
-                            items_id=parsed_items_id,
-                            sku_id=parsed_sku_id,
-                            created_at=timestamp,
-                        )
-                        session.add(existing_product)
-                        session.flush()
-                    existing_product.name = d_item.get("name", existing_product.name)
-                    existing_product.img_url = _extract_img_from_detail_items([d_item])
-                    existing_product.market_price = parsed_market_price
-                    existing_product.updated_at = timestamp
-                    item_snapshot_models.append(
-                        C2CItemSnapshot(
-                            c2c_items_id=item_id,
-                            snapshot_at=details_snapshot_at,
-                            product_id=int(existing_product.id),
-                            est_price=est_price,
-                        )
-                    )
-                if item_snapshot_models:
-                    session.add_all(item_snapshot_models)
-                    session.flush()
-
-                category_id = _sanitize_str(it.get("categoryId"))
-                if category_id is not None:
-                    row.category_id = category_id
-                row.type = it.get("type", row.type if row else None)
-                row.c2c_items_name = it.get("c2cItemsName", row.c2c_items_name if row else None)
-                row.total_items_count = it.get("totalItemsCount", row.total_items_count if row else None)
-                row.price = new_price if new_price is not None else (row.price if row else None)
-                row.show_price = it.get("showPrice", row.show_price if row else None)
-                row.show_market_price = it.get("showMarketPrice", row.show_market_price if row else None)
-                row.uid = it.get("uid", row.uid if row else None)
-                row.payment_time = it.get("paymentTime", row.payment_time if row else None)
-                if "isMyPublish" in it:
-                    row.is_my_publish = 1 if it.get("isMyPublish") else 0
-                incoming_uface = _normalize_uface(it.get("uface"))
-                row.uface = incoming_uface or (row.uface if row else None)
-                row.uname = it.get("uname", row.uname if row else None)
-                row.publish_status = it.get("publishStatus")
-                row.sale_status = it.get("saleStatus")
-                row.drop_reason = _sanitize_str(it.get("dropReason"))
                 if "detailDtoList" in it or is_new:
                     encoded_blob = _encode_detail_blob(materialized_detail_list)
-                    if is_cloudflare:
-                        pending_detail_blob_updates.append((item_id, encoded_blob.hex()))
-                    else:
-                        row.detail_blob = encoded_blob
-                row.updated_at = timestamp
-                if is_new:
-                    row.created_at = timestamp
+                    pending_detail_blob_updates.append((item_id, encoded_blob, encoded_blob.hex()))
+                    blob_write_count += 1
 
-                saved += 1
+                current_category = _sanitize_str(it.get("categoryId"))
+                c2c_payload = {
+                    "c2c_items_id": item_id,
+                    "category_id": current_category if current_category is not None else (row.category_id if row else None),
+                    "type": it.get("type", row.type if row else None),
+                    "c2c_items_name": it.get("c2cItemsName", row.c2c_items_name if row else None),
+                    "total_items_count": it.get("totalItemsCount", row.total_items_count if row else None),
+                    "price": new_price if new_price is not None else (row.price if row else None),
+                    "show_price": it.get("showPrice", row.show_price if row else None),
+                    "show_market_price": it.get("showMarketPrice", row.show_market_price if row else None),
+                    "uid": it.get("uid", row.uid if row else None),
+                    "payment_time": it.get("paymentTime", row.payment_time if row else None),
+                    "is_my_publish": (1 if it.get("isMyPublish") else 0) if "isMyPublish" in it else (row.is_my_publish if row else None),
+                    "uface": (_normalize_uface(it.get("uface")) or (row.uface if row else None)),
+                    "uname": it.get("uname", row.uname if row else None),
+                    "publish_status": it.get("publishStatus"),
+                    "sale_status": it.get("saleStatus"),
+                    "drop_reason": _sanitize_str(it.get("dropReason")),
+                    "created_at": timestamp if is_new else (row.created_at if row else None),
+                    "updated_at": timestamp,
+                }
                 if is_new:
+                    new_rows_payload.append(c2c_payload)
                     inserted += 1
+                    new_items_for_notify.append(it)
+                else:
+                    update_row = dict(c2c_payload)
+                    update_row["pk_c2c_items_id"] = item_id
+                    update_rows_payload.append(update_row)
+                saved += 1
+
+                normalized_details: List[Dict[str, Any]] = []
+                total_market_price = 0
+                for d_item in materialized_detail_list:
+                    raw_items_id = d_item.get("itemsId")
+                    if not raw_items_id:
+                        continue
+                    try:
+                        parsed_items_id = int(raw_items_id)
+                    except Exception:
+                        continue
+                    try:
+                        parsed_market_price = int(d_item.get("marketPrice", 0) or 0)
+                    except Exception:
+                        parsed_market_price = 0
+                    try:
+                        parsed_blindbox_id = int(d_item.get("blindBoxId")) if d_item.get("blindBoxId") is not None else 0
+                    except Exception:
+                        parsed_blindbox_id = 0
+                    try:
+                        parsed_sku_id = int(d_item.get("skuId")) if d_item.get("skuId") is not None else 0
+                    except Exception:
+                        parsed_sku_id = 0
+                    total_market_price += parsed_market_price
+                    product_key = (parsed_blindbox_id, parsed_items_id, parsed_sku_id)
+                    all_product_keys.add(product_key)
+                    normalized_details.append(
+                        {
+                            "product_key": product_key,
+                            "market_price": parsed_market_price,
+                            "name": d_item.get("name"),
+                            "img_url": _extract_img_from_detail_items([d_item]),
+                        }
+                    )
+
+                prepared_items.append(
+                    {
+                        "item_id": item_id,
+                        "new_price": new_price,
+                        "snapshot_at": _snapshot_now(),
+                        "timestamp": timestamp,
+                        "total_market_price": total_market_price,
+                        "details": normalized_details,
+                    }
+                )
             except Exception:
                 continue
 
-        if is_cloudflare and pending_detail_blob_updates:
-            # D1 JSON transport may coerce bytes params to TEXT; use SQL BLOB literal.
-            session.flush()
-            for blob_item_id, blob_hex in pending_detail_blob_updates:
-                session.execute(
-                    sa.text(
-                        f"""
-                        UPDATE c2c_items
-                        SET detail_blob = X'{blob_hex}'
-                        WHERE c2c_items_id = :c2c_items_id
-                        """
-                    ),
-                    {"c2c_items_id": int(blob_item_id)},
+        if new_rows_payload:
+            session.execute(sa.insert(C2CItem), new_rows_payload)
+        if update_rows_payload:
+            update_stmt = (
+                sa.update(C2CItem.__table__)
+                .where(C2CItem.__table__.c.c2c_items_id == sa.bindparam("pk_c2c_items_id"))
+                .values(
+                    category_id=sa.bindparam("category_id"),
+                    type=sa.bindparam("type"),
+                    c2c_items_name=sa.bindparam("c2c_items_name"),
+                    total_items_count=sa.bindparam("total_items_count"),
+                    price=sa.bindparam("price"),
+                    show_price=sa.bindparam("show_price"),
+                    show_market_price=sa.bindparam("show_market_price"),
+                    uid=sa.bindparam("uid"),
+                    payment_time=sa.bindparam("payment_time"),
+                    is_my_publish=sa.bindparam("is_my_publish"),
+                    uface=sa.bindparam("uface"),
+                    uname=sa.bindparam("uname"),
+                    publish_status=sa.bindparam("publish_status"),
+                    sale_status=sa.bindparam("sale_status"),
+                    drop_reason=sa.bindparam("drop_reason"),
+                    created_at=sa.bindparam("created_at"),
+                    updated_at=sa.bindparam("updated_at"),
+                )
+            )
+            session.execute(update_stmt, update_rows_payload)
+
+        product_by_key: Dict[Tuple[int, int, int], Product] = {}
+        if all_product_keys:
+            existing_products = session.scalars(
+                select(Product).where(
+                    sa.tuple_(Product.blindbox_id, Product.items_id, Product.sku_id).in_(list(all_product_keys))
+                )
+            ).all()
+            for product in existing_products:
+                product_by_key[(int(product.blindbox_id), int(product.items_id), int(product.sku_id))] = product
+
+        product_new_payload: List[Dict[str, Any]] = []
+        product_update_payload: List[Dict[str, Any]] = []
+        product_latest_fields: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        snapshot_candidates: List[Tuple[int, str, Tuple[int, int, int], Optional[int]]] = []
+
+        for prepared in prepared_items:
+            item_id = int(prepared["item_id"])
+            new_price = prepared.get("new_price")
+            snapshot_at = str(prepared["snapshot_at"])
+            total_market_price = int(prepared.get("total_market_price") or 0)
+            timestamp = str(prepared["timestamp"])
+            for detail in list(prepared["details"] or []):
+                product_key = detail["product_key"]
+                product_latest_fields[product_key] = {
+                    "name": detail.get("name"),
+                    "img_url": detail.get("img_url"),
+                    "market_price": int(detail.get("market_price") or 0),
+                    "updated_at": timestamp,
+                }
+                est_price: Optional[int] = None
+                if new_price is not None and total_market_price > 0:
+                    try:
+                        est_price = int(float(new_price) * float(int(detail.get("market_price") or 0)) / float(total_market_price))
+                    except Exception:
+                        est_price = None
+                snapshot_candidates.append((item_id, snapshot_at, product_key, est_price))
+
+        for product_key, latest in product_latest_fields.items():
+            existing_product = product_by_key.get(product_key)
+            if existing_product is None:
+                product_new_payload.append(
+                    {
+                        "blindbox_id": int(product_key[0]),
+                        "items_id": int(product_key[1]),
+                        "sku_id": int(product_key[2]),
+                        "name": latest.get("name"),
+                        "img_url": latest.get("img_url"),
+                        "market_price": int(latest.get("market_price") or 0),
+                        "created_at": str(latest.get("updated_at") or _now()),
+                        "updated_at": str(latest.get("updated_at") or _now()),
+                    }
+                )
+            else:
+                product_update_payload.append(
+                    {
+                        "pk_id": int(existing_product.id),
+                        "name": latest.get("name", existing_product.name),
+                        "img_url": latest.get("img_url", existing_product.img_url),
+                        "market_price": int(latest.get("market_price") or existing_product.market_price or 0),
+                        "updated_at": str(latest.get("updated_at") or _now()),
+                    }
                 )
 
-    return saved, inserted
+        if product_new_payload:
+            session.execute(sa.insert(Product), product_new_payload)
+            existing_products = session.scalars(
+                select(Product).where(
+                    sa.tuple_(Product.blindbox_id, Product.items_id, Product.sku_id).in_(list(all_product_keys))
+                )
+            ).all()
+            for product in existing_products:
+                product_by_key[(int(product.blindbox_id), int(product.items_id), int(product.sku_id))] = product
+
+        if product_update_payload:
+            product_update_stmt = (
+                sa.update(Product.__table__)
+                .where(Product.__table__.c.id == sa.bindparam("pk_id"))
+                .values(
+                    name=sa.bindparam("name"),
+                    img_url=sa.bindparam("img_url"),
+                    market_price=sa.bindparam("market_price"),
+                    updated_at=sa.bindparam("updated_at"),
+                )
+            )
+            session.execute(product_update_stmt, product_update_payload)
+
+        if snapshot_candidates:
+            snapshot_payload: List[Dict[str, Any]] = []
+            for item_id, snapshot_at, product_key, est_price in snapshot_candidates:
+                product = product_by_key.get(product_key)
+                if product is None or product.id is None:
+                    continue
+                snapshot_payload.append(
+                    {
+                        "c2c_items_id": item_id,
+                        "snapshot_at": snapshot_at,
+                        "product_id": int(product.id),
+                        "est_price": est_price,
+                    }
+                )
+            if snapshot_payload:
+                session.execute(sa.insert(C2CItemSnapshot), snapshot_payload)
+
+        # Phase 1 done: data rows/snapshots/products are written first (without detail_blob).
+        session.flush()
+        data_write_ms = int((time.perf_counter() - data_write_started_at) * 1000)
+
+    return {
+        "backend_name": backend_name,
+        "is_cloudflare": is_cloudflare,
+        "saved": int(saved),
+        "inserted": int(inserted),
+        "data_write_ms": int(data_write_ms),
+        "blob_write_count": int(blob_write_count),
+        "pending_blob_updates": pending_detail_blob_updates,
+        "new_items": new_items_for_notify,
+    }
+
+
+def flush_pending_blob_updates(
+    pending_blob_updates: List[Tuple[int, bytes, str]],
+    *,
+    is_cloudflare: bool,
+    backend_name: str,
+) -> Dict[str, int]:
+    if not pending_blob_updates:
+        return {"blob_write_ms": 0, "blob_write_count": 0}
+
+    backend = _require_sqlalchemy_backend()
+    blob_write_started_at = time.perf_counter()
+    with backend.session() as session:
+        session.flush()
+        # Use one batched statement for all rows to reduce DB round-trips.
+        # Use hex blob literals for both backends to avoid D1 bytes coercion issues.
+        case_lines: List[str] = []
+        id_literals: List[str] = []
+        for blob_item_id, _, blob_hex in pending_blob_updates:
+            cid = int(blob_item_id)
+            id_literals.append(str(cid))
+            case_lines.append(f"WHEN {cid} THEN X'{blob_hex}'")
+        case_sql = " ".join(case_lines)
+        in_sql = ", ".join(id_literals)
+        stmt = sa.text(
+            f"""
+            UPDATE c2c_items
+            SET detail_blob = CASE c2c_items_id
+            {case_sql}
+            END
+            WHERE c2c_items_id IN ({in_sql})
+            """
+        )
+        session.execute(stmt)
+    blob_write_ms = int((time.perf_counter() - blob_write_started_at) * 1000)
+    blob_write_count = len(pending_blob_updates)
+    _log_blob_write_complete(backend_name, blob_write_count)
+    return {"blob_write_ms": int(blob_write_ms), "blob_write_count": int(blob_write_count)}
+
+
+def save_items_with_metrics(items: List[Dict[str, Any]]) -> Dict[str, int]:
+    phase_result = save_items_data_phase(items)
+    pending_blob_updates = list(phase_result.get("pending_blob_updates") or [])
+    backend_name = str(phase_result.get("backend_name") or get_db_backend_name())
+    is_cloudflare = bool(phase_result.get("is_cloudflare") is True)
+    blob_result = flush_pending_blob_updates(
+        pending_blob_updates,
+        is_cloudflare=is_cloudflare,
+        backend_name=backend_name,
+    )
+    return {
+        "saved": int(phase_result.get("saved") or 0),
+        "inserted": int(phase_result.get("inserted") or 0),
+        "data_write_ms": int(phase_result.get("data_write_ms") or 0),
+        "blob_write_ms": int(blob_result.get("blob_write_ms") or 0),
+        "blob_write_count": int(blob_result.get("blob_write_count") or 0),
+    }
+
+
+def save_items(items: List[Dict[str, Any]]) -> Tuple[int, int]:
+    result = save_items_with_metrics(items)
+    return int(result.get("saved", 0)), int(result.get("inserted", 0))
 
 
 def filter_new_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -1,5 +1,52 @@
 # Work Log
 
+## 2026-03-10 Scan Trace ID, Async BLOB Queue, and Full Batch Write Path
+
+### Planned
+
+- Add a per-scan trace id and keep it visible in both scan and BLOB logs.
+- Ensure scan loop can proceed to next round after data write phase without waiting for BLOB persistence.
+- Add BLOB concurrency guardrails (limit and threshold alert).
+- Batch the write path to reduce D1/remote DB round-trips, including single-request BLOB batch update.
+
+### Step Log
+
+1. Added scan trace id generation in `src/backend/cron_runner.py` and propagated the same id through:
+   - scan start/completion/error/wait logs,
+   - BLOB queued/completed logs.
+2. Split DB write pipeline into explicit phases in `src/bsm/db.py`:
+   - `save_items_data_phase` for data rows/snapshots/products,
+   - `flush_pending_blob_updates` for blob writes.
+3. Updated cron finalization to:
+   - finish round after `save_items_data_phase`,
+   - dispatch BLOB writes asynchronously in background tasks,
+   - keep queue/task cleanup on loop tick and shutdown.
+4. Added BLOB concurrency controls in cron:
+   - max running concurrency = `10`,
+   - threshold warning = `8` (sends admin TG alert once per high-water period).
+5. Removed cron-side `filter_new_items` extra DB prequery and returned `new_items` directly from data phase to keep notification semantics while reducing accesses.
+6. Reworked write path batching:
+   - `c2c_items` batch insert/update,
+   - `product` batch lookup + insert/update,
+   - `c2c_items_snapshot` batch insert.
+7. Replaced per-item BLOB loop update with one `UPDATE ... CASE WHEN ...` batched statement per flush.
+8. Bumped frontend version to `0.9.5.4` in:
+   - `src/frontend/package.json`
+   - `src/frontend/src/lib/appInfo.ts`
+9. Added runtime-configurable API request behavior:
+   - introduced `api_request_mode` (`async`/`sync`) and `scan_timeout_seconds` in runtime config loading (`src/bsm/settings.py`),
+   - exposed both fields in settings API read/update validation (`src/backend/routers/settings.py`),
+   - updated config templates/docs (`config.yaml.example`, `README.md`).
+10. Added async mall request path in `src/bsm/mall.py` and async scan entry `scan_once_async` in `src/bsm/scan.py`, with timeout driven by `scan_timeout_seconds`.
+11. Updated admin settings page to include API mode/timeout controls and switched key numeric fields to text-backed editing + save-time validation to avoid number-input wheel drift.
+12. Added `httpx>=0.27.0` dependency and adjusted backend app metadata version in `src/backend/main.py`.
+
+### Verification
+
+- `pytest -q src/backend/testsuite/test_db.py src/backend/testsuite/test_cron_runner.py`
+- `pytest -q src/backend/testsuite/test_settings_router.py`
+- `pnpm -C src/frontend lint`
+
 ## 2026-03-08 Scan Log Duration Split, D1 Diagnostics Timeout Mitigation, and Orphan-Repair API Removal
 
 ### Planned

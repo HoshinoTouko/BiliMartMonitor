@@ -88,6 +88,8 @@ export default function MarketFeedPage() {
     const [countdown, setCountdown] = useState(20);
     const [error, setError] = useState("");
     const [scanInterval, setScanInterval] = useState(20);
+    const [pageInput, setPageInput] = useState("1");
+    const [pageJumpOpen, setPageJumpOpen] = useState(false);
 
     // Fetch scanner settings to get interval
     useEffect(() => {
@@ -113,7 +115,8 @@ export default function MarketFeedPage() {
         time: string,
         categories: string[],
         isSilentRefresh: boolean = false,
-    ) => {
+        scrollOnSuccess: boolean = false,
+    ): Promise<boolean> => {
         if (!isSilentRefresh) setLoading(true);
         else setRefreshing(true);
         setError("");
@@ -137,13 +140,22 @@ export default function MarketFeedPage() {
             const data = await apiGet(url) as { items?: MarketItem[], pagination: Pagination };
             setItems(data.items ?? []);
             setPagination(data.pagination);
+            if (scrollOnSuccess) {
+                window.scrollTo({ top: 0, behavior: "smooth" });
+            }
+            return true;
         } catch (e: unknown) {
             setError(e instanceof Error ? e.message : "加载失败");
+            return false;
         } finally {
             if (!isSilentRefresh) setLoading(false);
             else setRefreshing(false);
         }
     }, []);
+
+    useEffect(() => {
+        setPageInput(String(pagination.page));
+    }, [pagination.page]);
 
     // Auto-refresh interval (1s tick)
     useEffect(() => {
@@ -203,9 +215,21 @@ export default function MarketFeedPage() {
         if (e.key === "Enter") handleSearch();
     };
 
-    const handlePage = (p: number) => {
-        fetchItems(p, query, sortBy, timeFilter, categoryFilters);
-        setPagination((prev) => ({ ...prev, page: p }));
+    const handlePage = async (p: number) => {
+        const targetPage = Math.min(Math.max(1, p), Math.max(1, pagination.total_pages));
+        await fetchItems(targetPage, query, sortBy, timeFilter, categoryFilters, false, true);
+    };
+
+    const handlePageJump = async () => {
+        const parsed = Number.parseInt(pageInput, 10);
+        if (!Number.isFinite(parsed)) {
+            setPageInput(String(pagination.page));
+            return;
+        }
+        const targetPage = Math.min(Math.max(1, parsed), Math.max(1, pagination.total_pages));
+        setPageInput(String(targetPage));
+        await handlePage(targetPage);
+        setPageJumpOpen(false);
     };
 
     const categoryLabel = categoryFilters.length === 0
@@ -556,6 +580,46 @@ export default function MarketFeedPage() {
                     >
                         下一页 →
                     </button>
+                    <div className="bsm-page-jump">
+                        {!pageJumpOpen ? (
+                            <button
+                                className="bsm-btn bsm-btn-outline bsm-btn-sm"
+                                onClick={() => setPageJumpOpen(true)}
+                            >
+                                跳页
+                            </button>
+                        ) : (
+                            <>
+                                <input
+                                    className="bsm-input bsm-input-sm"
+                                    type="number"
+                                    min={1}
+                                    max={Math.max(1, pagination.total_pages)}
+                                    value={pageInput}
+                                    onChange={(e) => setPageInput(e.target.value)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === "Enter") {
+                                            e.preventDefault();
+                                            handlePageJump();
+                                        }
+                                        if (e.key === "Escape") {
+                                            e.preventDefault();
+                                            setPageInput(String(pagination.page));
+                                            setPageJumpOpen(false);
+                                        }
+                                    }}
+                                    style={{ width: "84px" }}
+                                    autoFocus
+                                />
+                                <button
+                                    className="bsm-btn bsm-btn-outline bsm-btn-sm"
+                                    onClick={handlePageJump}
+                                >
+                                    前往
+                                </button>
+                            </>
+                        )}
+                    </div>
                 </div>
             )}
         </Shell>

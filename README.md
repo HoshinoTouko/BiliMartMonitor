@@ -140,6 +140,8 @@ PYTHONPATH=src ./.venv/bin/alembic upgrade head
 ```yaml
 scan_mode: latest
 interval: 20
+api_request_mode: async
+scan_timeout_seconds: 15
 category: "2312"
 timezone: Asia/Shanghai
 bili_session_pick_mode: round_robin

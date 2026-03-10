@@ -1,4 +1,5 @@
 requests
+httpx>=0.27.0
 qrcode[pil]
 sqlalchemy>=2.0.0
 sqlalchemy-cloudflare-d1==0.3.6

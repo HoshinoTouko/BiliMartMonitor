@@ -83,6 +83,8 @@ def _load_settings() -> Dict[str, Any]:
         "bili_session_pick_mode": cfg.get("bili_session_pick_mode", "round_robin"),
         "bili_session_cooldown_seconds": cfg.get("bili_session_cooldown_seconds", 60),
         "admin_scan_summary_interval_seconds": cfg.get("admin_scan_summary_interval_seconds", 600),
+        "api_request_mode": cfg.get("api_request_mode", "async"),
+        "scan_timeout_seconds": cfg.get("scan_timeout_seconds", 15),
         "admin_telegram_ids": cfg.get("admin_telegram_ids") or [],
         "price_filters": _filter_selection_for_response(cfg.get("price_filters"), _ALL_PRICE_FILTERS),
         "discount_filters": _filter_selection_for_response(cfg.get("discount_filters"), _ALL_DISCOUNT_FILTERS),
@@ -103,6 +105,8 @@ class SettingsUpdate(BaseModel):
     bili_session_pick_mode: Optional[str] = None
     bili_session_cooldown_seconds: Optional[int] = None
     admin_scan_summary_interval_seconds: Optional[int] = None
+    api_request_mode: Optional[str] = None
+    scan_timeout_seconds: Optional[float] = None
     admin_telegram_ids: Optional[List[str]] = None
     price_filters: Optional[List[str]] = None
     discount_filters: Optional[List[str]] = None
@@ -389,6 +393,23 @@ async def api_update_settings(body: SettingsUpdate, _: Dict[str, Any] = Depends(
                 return JSONResponse({"error": "admin_scan_summary_interval_seconds must be > 0"}, status_code=422)
             _save_setting("admin_scan_summary_interval_seconds", body.admin_scan_summary_interval_seconds)
             updated["admin_scan_summary_interval_seconds"] = body.admin_scan_summary_interval_seconds
+
+        if body.api_request_mode is not None:
+            api_request_mode = str(body.api_request_mode).strip().lower()
+            if api_request_mode not in ("sync", "async"):
+                return JSONResponse({"error": "api_request_mode must be 'sync' or 'async'"}, status_code=422)
+            _save_setting("api_request_mode", api_request_mode)
+            updated["api_request_mode"] = api_request_mode
+
+        if body.scan_timeout_seconds is not None:
+            try:
+                timeout = float(body.scan_timeout_seconds)
+            except Exception:
+                return JSONResponse({"error": "scan_timeout_seconds must be a number"}, status_code=422)
+            if timeout <= 0:
+                return JSONResponse({"error": "scan_timeout_seconds must be > 0"}, status_code=422)
+            _save_setting("scan_timeout_seconds", timeout)
+            updated["scan_timeout_seconds"] = timeout
 
         if body.admin_telegram_ids is not None:
             admin_telegram_ids: List[str] = []

@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.9.5.4] — 2026-03-10
+
+### Changed
+
+- **Scan Trace ID**: Added per-scan `追踪ID` across scan lifecycle logs (`开始扫描` / `扫描完成` / `扫描出错` / `下次扫描`) and propagated the same trace id into BLOB queue/finish logs for end-to-end correlation.
+- **DB/BLOB Pipeline Decoupling**: Scan finalization now completes after data-phase writes, while BLOB writes run in background tasks so next scan round is not blocked by BLOB persistence.
+- **BLOB Concurrency Control**: Added BLOB background write concurrency limit (`10`) with admin Telegram warning when running concurrency reaches threshold (`8`).
+- **Write Path Batch Optimization**: Reworked `save_items_data_phase` to batch writes for `c2c_items`, `product`, and `c2c_items_snapshot`, and removed cron-side `filter_new_items` prequery by returning `new_items` directly from write phase.
+- **BLOB Batch Update**: Replaced per-item BLOB update loop with a single batched `UPDATE ... CASE WHEN ...` statement for each flush batch.
+- **Configurable API Request Engine**: Added runtime setting `api_request_mode` (`async`/`sync`) and `scan_timeout_seconds`, wired through YAML config, settings API, and admin settings UI.
+- **Async Mall API Path**: Added `httpx`-based async implementations for list/detail mall requests and introduced `scan_once_async` timeout-aware path while keeping sync compatibility.
+- **Admin Settings Numeric UX**: Numeric settings fields now use text-backed state with explicit validation/save-time parsing and wheel-blur handling to avoid accidental mouse-wheel value drift.
+- **Config Samples/Docs Alignment**: Updated `README.md` and `config.yaml.example` with `api_request_mode` and `scan_timeout_seconds` examples/defaults.
+- **Backend App Version**: Updated FastAPI app version string to `0.9.5.2` in runtime metadata.
+- **Frontend Version Bump**: Updated frontend/app version to `0.9.5.4`.
+
+### Tests
+
+- Verified backend suites:
+  - `src/backend/testsuite/test_db.py`
+  - `src/backend/testsuite/test_cron_runner.py`
+  - `src/backend/testsuite/test_settings_router.py`
+- Verified frontend lint:
+  - `pnpm -C src/frontend lint`
+
 ## [0.9.5.2] — 2026-03-08
 
 ### Changed
