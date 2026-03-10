@@ -166,7 +166,7 @@ async def lifespan(app: FastAPI):
     log.info("Cron, Telegram bot and monitor background tasks stopped")
 
 
-app = FastAPI(title="BiliMartMonitor API", version="0.9.5.2", lifespan=lifespan)
+app = FastAPI(title="BiliMartMonitor API", version="0.9.5.5", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # CORS — allow Next.js dev server

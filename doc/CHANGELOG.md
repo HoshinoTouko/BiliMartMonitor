@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.9.5.5] — 2026-03-10
+
+### Changed
+
+- **Session Cache in Cron**: Added in-memory active-session cache for scan rounds. Cron now loads sessions from DB on cold start, reuses cache between rounds, applies write-back updates after each scan result, and refreshes cache from DB immediately when session-related scan failures are detected.
+- **`c2c_items` Upsert Path**: Merged existence-check + write path into a single `UPSERT` path. For inserted/new-item detection, the write path now prefers `UPSERT ... RETURNING` and falls back to a compatibility `SELECT` only when needed.
+- **`product` / `snapshot` Path Merge**: Removed extra product-id backfill query by writing snapshots via `INSERT ... SELECT ... FROM product`.
+- **Scan Write Semantics for Details**: Scan data-phase no longer reads old `detail_blob` values; `detailDtoList` is treated as latest payload. `detail_blob` is only touched in asynchronous flush writes.
+- **`save_items` Effective Write Order**: Runtime write order is now explicitly `product -> c2c_items -> c2c_items_snapshot -> detail_blob(async)`.
+- **DB Round-trip Reduction**: Reduced DB API calls per scan round by merging multiple read/write steps and introducing session cache reuse.
+- **Backend App Version**: Updated FastAPI app version to `0.9.5.5`.
+- **Frontend Version Bump**: Updated frontend/app version to `0.9.5.5`.
+
+### Tests
+
+- Added cron regression test:
+  - `test_session_failure_triggers_cache_refresh` in `src/backend/testsuite/test_cron_runner.py`
+- Updated DB tests for latest-payload detail behavior:
+  - `test_save_items_uses_latest_sparse_detail_payload`
+  - latest snapshot/detail estimation assertions
+- Verified suites:
+  - `src/backend/testsuite/test_cron_runner.py`
+  - `src/backend/testsuite/test_db.py`
+  - `src/backend/testsuite/test_perf_optimizations.py`
+
 ## [0.9.5.4] — 2026-03-10
 
 ### Changed
@@ -59,7 +84,7 @@
 
 ### Changed
 
-- **`save_items` Write Order**: Enforced write sequence as `product -> c2c_items_snapshot -> c2c_items/detail_blob`.
+- **`save_items` Write Order**: Enforced write sequence as `product -> c2c_items -> c2c_items_snapshot -> detail_blob` (snapshot keeps FK to `c2c_items`).
 - **Avatar Serialization**: API responses now always return a usable `uface`; empty/default-normalized values are serialized to Bilibili's `noface` URL.
 - **Detail Merge Semantics**: Incremental detail writes preserve unmatched existing detail rows while overriding matched rows by key `(itemsId, skuId, blindBoxId)`.
 - **Market On-Access Hydration**: Item/recent-listing routes trigger asynchronous background detail hydration when item `detail_blob` is semantically empty.

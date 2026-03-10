@@ -44,6 +44,8 @@ _BLOB_ALERT_THRESHOLD = 8
 _BLOB_ALERT_ACTIVE = False
 _BLOB_RUNNING_COUNT = 0
 _SCAN_PROGRESS_LOADED = False
+_SESSION_CACHE_LOADED = False
+_SESSION_CACHE: dict[str, dict[str, object]] = {}
 _WAIT_PREFIX = "[WAIT]"
 _EXEC_PREFIX = "[EXEC]"
 
@@ -351,6 +353,87 @@ def _is_session_available(session: dict, cooldown_seconds: int) -> bool:
     return checked_at <= (datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds))
 
 
+def _is_session_failure_error(error: str) -> bool:
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    keywords = (
+        "session",
+        "cookie",
+        "login",
+        "鉴权",
+        "未登录",
+        "失效",
+        "过期",
+        "风控",
+        "rate",
+        "429",
+    )
+    return any(keyword in text for keyword in keywords)
+
+
+def _session_username(session: dict[str, object]) -> str:
+    return str(session.get("login_username") or "").strip()
+
+
+def _clone_session(session: dict[str, object]) -> dict[str, object]:
+    return dict(session)
+
+
+def _set_session_cache(raw_sessions: list[dict]) -> None:
+    global _SESSION_CACHE, _SESSION_CACHE_LOADED
+    cache: dict[str, dict[str, object]] = {}
+    for session in raw_sessions:
+        if not isinstance(session, dict):
+            continue
+        username = _session_username(session)
+        if not username:
+            continue
+        cache[username] = _clone_session(session)
+    _SESSION_CACHE = cache
+    _SESSION_CACHE_LOADED = True
+
+
+def _load_session_cache(fetch_sessions: callable) -> list[dict[str, object]]:
+    global _SESSION_CACHE_LOADED
+    if not _SESSION_CACHE_LOADED:
+        _set_session_cache(fetch_sessions(status="active"))
+    return [_clone_session(session) for session in _SESSION_CACHE.values()]
+
+
+def _refresh_session_cache(fetch_sessions: callable) -> list[dict[str, object]]:
+    _set_session_cache(fetch_sessions(status="active"))
+    return [_clone_session(session) for session in _SESSION_CACHE.values()]
+
+
+def _update_cached_session_scan_result(username: str, *, error: str | None, fetched_count: int = 0) -> None:
+    key = str(username or "").strip()
+    if not key:
+        return
+    cached = _SESSION_CACHE.get(key)
+    if cached is None:
+        return
+    now_text = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cached["last_checked_at"] = now_text
+    cached["updated_at"] = now_text
+    if error is None:
+        cached["last_error"] = None
+        cached["last_success_fetch_at"] = now_text
+        try:
+            base_count = int(cached.get("fetch_count") or 0)
+        except Exception:
+            base_count = 0
+        cached["fetch_count"] = max(0, base_count + max(0, int(fetched_count or 0)))
+    else:
+        cached["last_error"] = str(error)
+
+
+def _reset_session_cache() -> None:
+    global _SESSION_CACHE_LOADED, _SESSION_CACHE
+    _SESSION_CACHE_LOADED = False
+    _SESSION_CACHE = {}
+
+
 def _assign_sessions_to_categories(
     categories: list[str | None],
     sessions: list[dict],
@@ -402,7 +485,7 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
         list_bili_sessions,
         save_items_data_phase,
         flush_pending_blob_updates,
-        record_bili_session_fetch_success,
+        record_bili_session_scan_success,
         mark_bili_session_result,
     )
     from bsm.scan import scan_once, scan_once_async, ScanRateLimitedError
@@ -431,8 +514,11 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
     categories = _normalize_categories(cfg.get("category"))
     _load_scan_progress()
     cooldown_seconds = int(cfg.get("bili_session_cooldown_seconds", 60) or 60)
-    raw_sessions = await asyncio.to_thread(list_bili_sessions, status="active")
+    raw_sessions = await asyncio.to_thread(_load_session_cache, list_bili_sessions)
     available_sessions = [session for session in raw_sessions if _is_session_available(session, cooldown_seconds)]
+    if not available_sessions:
+        raw_sessions = await asyncio.to_thread(_refresh_session_cache, list_bili_sessions)
+        available_sessions = [session for session in raw_sessions if _is_session_available(session, cooldown_seconds)]
     if not available_sessions:
         _log_wait("跳过：无可用 session，请先登录", level="warn")
         return {
@@ -475,6 +561,17 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
             category = job.get("category")
             page = int(job.get("page") or 0)
             items = list(job.get("items") or [])
+            if not items:
+                return (category, page), {
+                    "new_items": [],
+                    "saved": 0,
+                    "inserted": 0,
+                    "db_duration_ms": 0,
+                    "blob_write_count": 0,
+                    "pending_blob_updates": [],
+                    "blob_backend_name": "",
+                    "blob_is_cloudflare": False,
+                }
 
             def _run_db_pipeline() -> dict[str, object]:
                 save_result = save_items_data_phase(items)
@@ -508,6 +605,7 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
         summary_rows: list[dict[str, object]] = []
         notify_items: list[dict] = []
         session_success_count: dict[str, int] = {}
+        session_had_error_before: dict[str, bool] = {}
         session_errors: dict[str, str] = {}
         max_pages = _max_pages_for_mode(mode)
         continue_like_mode = mode in {"continue", "continue_until_repeat"}
@@ -645,17 +743,24 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
             _log_wait(f"下次扫描 | 分类 {_category_label(category)} | 第 {_mode_page(mode, category)} 页 | 追踪ID {trace_id}")
             if username and username not in session_errors:
                 session_success_count[username] = session_success_count.get(username, 0) + len(items)
+                if username not in session_had_error_before:
+                    session_had_error_before[username] = bool(str(session.get("last_error") or "").strip())
 
         _save_scan_progress()
 
         for username, fetched_count in session_success_count.items():
             if username in session_errors:
                 continue
-            await asyncio.to_thread(record_bili_session_fetch_success, username, fetched_count=fetched_count)
-            await asyncio.to_thread(mark_bili_session_result, username, None)
+            if int(fetched_count or 0) <= 0 and not session_had_error_before.get(username, False):
+                continue
+            await asyncio.to_thread(record_bili_session_scan_success, username, fetched_count=fetched_count)
+            _update_cached_session_scan_result(username, error=None, fetched_count=int(fetched_count or 0))
         for username, error in session_errors.items():
             if username:
                 await asyncio.to_thread(mark_bili_session_result, username, error)
+                _update_cached_session_scan_result(username, error=error)
+        if any(_is_session_failure_error(err) for err in session_errors.values()):
+            await asyncio.to_thread(_refresh_session_cache, list_bili_sessions)
 
         try:
             notifier = await asyncio.to_thread(load_notifier, cfg.get("notify"))
@@ -851,4 +956,5 @@ async def cron_loop() -> None:
     _BLOB_WRITE_SEMAPHORE = None
     _BLOB_ALERT_ACTIVE = False
     _BLOB_RUNNING_COUNT = 0
+    _reset_session_cache()
     _log_wait("后台扫描任务已停止")

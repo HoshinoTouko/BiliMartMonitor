@@ -1580,7 +1580,6 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     backend = _require_sqlalchemy_backend()
     backend_name = get_db_backend_name()
     is_cloudflare = backend_name == "cloudflare"
-    ids = [int(it["c2cItemsId"]) for it in items if it.get("c2cItemsId") is not None]
     inserted = 0
     saved = 0
     blob_write_count = 0
@@ -1588,17 +1587,11 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     data_write_ms = 0
 
     with backend.session() as session:
-        existing_rows: Dict[int, C2CItem] = {}
-        if ids:
-            rows = session.scalars(select(C2CItem).where(C2CItem.c2c_items_id.in_(ids))).all()
-            existing_rows = {int(row.c2c_items_id): row for row in rows}
-
         pending_detail_blob_updates: List[Tuple[int, bytes, str]] = []
         prepared_items: List[Dict[str, Any]] = []
-        all_product_keys: set[Tuple[int, int, int]] = set()
-        new_rows_payload: List[Dict[str, Any]] = []
-        update_rows_payload: List[Dict[str, Any]] = []
+        c2c_upsert_payload: List[Dict[str, Any]] = []
         new_items_for_notify: List[Dict[str, Any]] = []
+        timestamp_now = _now()
 
         for it in items:
             item_id = it.get("c2cItemsId")
@@ -1610,30 +1603,15 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                 continue
 
             try:
-                row = existing_rows.get(item_id)
-                is_new = row is None
-                timestamp = _now()
+                timestamp = timestamp_now
                 new_price = it.get("price")
 
                 detail_list = it.get("detailDtoList", [])
                 if not isinstance(detail_list, list):
                     detail_list = []
-                existing_detail_list: List[Dict[str, Any]] = []
-                if row is not None and getattr(row, "detail_blob", None):
-                    existing_detail_list = _decode_detail_blob(getattr(row, "detail_blob", None))
+                materialized_detail_list: List[Dict[str, Any]] = detail_list
 
-                materialized_detail_list: List[Dict[str, Any]] = []
                 if "detailDtoList" in it:
-                    if detail_list:
-                        materialized_detail_list = _merge_detail_list_with_existing(detail_list, existing_detail_list)
-                    else:
-                        materialized_detail_list = existing_detail_list
-                elif is_new:
-                    materialized_detail_list = []
-                else:
-                    materialized_detail_list = existing_detail_list
-
-                if "detailDtoList" in it or is_new:
                     encoded_blob = _encode_detail_blob(materialized_detail_list)
                     pending_detail_blob_updates.append((item_id, encoded_blob, encoded_blob.hex()))
                     blob_write_count += 1
@@ -1641,32 +1619,25 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                 current_category = _sanitize_str(it.get("categoryId"))
                 c2c_payload = {
                     "c2c_items_id": item_id,
-                    "category_id": current_category if current_category is not None else (row.category_id if row else None),
-                    "type": it.get("type", row.type if row else None),
-                    "c2c_items_name": it.get("c2cItemsName", row.c2c_items_name if row else None),
-                    "total_items_count": it.get("totalItemsCount", row.total_items_count if row else None),
-                    "price": new_price if new_price is not None else (row.price if row else None),
-                    "show_price": it.get("showPrice", row.show_price if row else None),
-                    "show_market_price": it.get("showMarketPrice", row.show_market_price if row else None),
-                    "uid": it.get("uid", row.uid if row else None),
-                    "payment_time": it.get("paymentTime", row.payment_time if row else None),
-                    "is_my_publish": (1 if it.get("isMyPublish") else 0) if "isMyPublish" in it else (row.is_my_publish if row else None),
-                    "uface": (_normalize_uface(it.get("uface")) or (row.uface if row else None)),
-                    "uname": it.get("uname", row.uname if row else None),
+                    "category_id": current_category,
+                    "type": it.get("type"),
+                    "c2c_items_name": it.get("c2cItemsName"),
+                    "total_items_count": it.get("totalItemsCount"),
+                    "price": new_price,
+                    "show_price": it.get("showPrice"),
+                    "show_market_price": it.get("showMarketPrice"),
+                    "uid": it.get("uid"),
+                    "payment_time": it.get("paymentTime"),
+                    "is_my_publish": (1 if it.get("isMyPublish") else 0) if "isMyPublish" in it else None,
+                    "uface": _normalize_uface(it.get("uface")),
+                    "uname": it.get("uname"),
                     "publish_status": it.get("publishStatus"),
                     "sale_status": it.get("saleStatus"),
                     "drop_reason": _sanitize_str(it.get("dropReason")),
-                    "created_at": timestamp if is_new else (row.created_at if row else None),
+                    "created_at": timestamp,
                     "updated_at": timestamp,
                 }
-                if is_new:
-                    new_rows_payload.append(c2c_payload)
-                    inserted += 1
-                    new_items_for_notify.append(it)
-                else:
-                    update_row = dict(c2c_payload)
-                    update_row["pk_c2c_items_id"] = item_id
-                    update_rows_payload.append(update_row)
+                c2c_upsert_payload.append(c2c_payload)
                 saved += 1
 
                 normalized_details: List[Dict[str, Any]] = []
@@ -1693,7 +1664,6 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                         parsed_sku_id = 0
                     total_market_price += parsed_market_price
                     product_key = (parsed_blindbox_id, parsed_items_id, parsed_sku_id)
-                    all_product_keys.add(product_key)
                     normalized_details.append(
                         {
                             "product_key": product_key,
@@ -1716,48 +1686,8 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             except Exception:
                 continue
 
-        if new_rows_payload:
-            session.execute(sa.insert(C2CItem), new_rows_payload)
-        if update_rows_payload:
-            update_stmt = (
-                sa.update(C2CItem.__table__)
-                .where(C2CItem.__table__.c.c2c_items_id == sa.bindparam("pk_c2c_items_id"))
-                .values(
-                    category_id=sa.bindparam("category_id"),
-                    type=sa.bindparam("type"),
-                    c2c_items_name=sa.bindparam("c2c_items_name"),
-                    total_items_count=sa.bindparam("total_items_count"),
-                    price=sa.bindparam("price"),
-                    show_price=sa.bindparam("show_price"),
-                    show_market_price=sa.bindparam("show_market_price"),
-                    uid=sa.bindparam("uid"),
-                    payment_time=sa.bindparam("payment_time"),
-                    is_my_publish=sa.bindparam("is_my_publish"),
-                    uface=sa.bindparam("uface"),
-                    uname=sa.bindparam("uname"),
-                    publish_status=sa.bindparam("publish_status"),
-                    sale_status=sa.bindparam("sale_status"),
-                    drop_reason=sa.bindparam("drop_reason"),
-                    created_at=sa.bindparam("created_at"),
-                    updated_at=sa.bindparam("updated_at"),
-                )
-            )
-            session.execute(update_stmt, update_rows_payload)
-
-        product_by_key: Dict[Tuple[int, int, int], Product] = {}
-        if all_product_keys:
-            existing_products = session.scalars(
-                select(Product).where(
-                    sa.tuple_(Product.blindbox_id, Product.items_id, Product.sku_id).in_(list(all_product_keys))
-                )
-            ).all()
-            for product in existing_products:
-                product_by_key[(int(product.blindbox_id), int(product.items_id), int(product.sku_id))] = product
-
-        product_new_payload: List[Dict[str, Any]] = []
-        product_update_payload: List[Dict[str, Any]] = []
         product_latest_fields: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
-        snapshot_candidates: List[Tuple[int, str, Tuple[int, int, int], Optional[int]]] = []
+        snapshot_candidates: List[Tuple[int, str, int, int, int, Optional[int]]] = []
 
         for prepared in prepared_items:
             item_id = int(prepared["item_id"])
@@ -1779,12 +1709,22 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                         est_price = int(float(new_price) * float(int(detail.get("market_price") or 0)) / float(total_market_price))
                     except Exception:
                         est_price = None
-                snapshot_candidates.append((item_id, snapshot_at, product_key, est_price))
+                snapshot_candidates.append(
+                    (
+                        item_id,
+                        snapshot_at,
+                        int(product_key[0]),
+                        int(product_key[1]),
+                        int(product_key[2]),
+                        est_price,
+                    )
+                )
 
-        for product_key, latest in product_latest_fields.items():
-            existing_product = product_by_key.get(product_key)
-            if existing_product is None:
-                product_new_payload.append(
+        if product_latest_fields:
+            product_upsert_payload: List[Dict[str, Any]] = []
+            for product_key, latest in product_latest_fields.items():
+                updated_at = str(latest.get("updated_at") or _now())
+                product_upsert_payload.append(
                     {
                         "blindbox_id": int(product_key[0]),
                         "items_id": int(product_key[1]),
@@ -1792,60 +1732,138 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                         "name": latest.get("name"),
                         "img_url": latest.get("img_url"),
                         "market_price": int(latest.get("market_price") or 0),
-                        "created_at": str(latest.get("updated_at") or _now()),
-                        "updated_at": str(latest.get("updated_at") or _now()),
+                        "created_at": updated_at,
+                        "updated_at": updated_at,
                     }
                 )
-            else:
-                product_update_payload.append(
-                    {
-                        "pk_id": int(existing_product.id),
-                        "name": latest.get("name", existing_product.name),
-                        "img_url": latest.get("img_url", existing_product.img_url),
-                        "market_price": int(latest.get("market_price") or existing_product.market_price or 0),
-                        "updated_at": str(latest.get("updated_at") or _now()),
-                    }
-                )
-
-        if product_new_payload:
-            session.execute(sa.insert(Product), product_new_payload)
-            existing_products = session.scalars(
-                select(Product).where(
-                    sa.tuple_(Product.blindbox_id, Product.items_id, Product.sku_id).in_(list(all_product_keys))
-                )
-            ).all()
-            for product in existing_products:
-                product_by_key[(int(product.blindbox_id), int(product.items_id), int(product.sku_id))] = product
-
-        if product_update_payload:
-            product_update_stmt = (
-                sa.update(Product.__table__)
-                .where(Product.__table__.c.id == sa.bindparam("pk_id"))
-                .values(
-                    name=sa.bindparam("name"),
-                    img_url=sa.bindparam("img_url"),
-                    market_price=sa.bindparam("market_price"),
-                    updated_at=sa.bindparam("updated_at"),
-                )
+            session.execute(
+                sa.text(
+                    """
+                    INSERT INTO product (
+                        blindbox_id, items_id, sku_id, name, img_url, market_price, created_at, updated_at
+                    )
+                    VALUES (
+                        :blindbox_id, :items_id, :sku_id, :name, :img_url, :market_price, :created_at, :updated_at
+                    )
+                    ON CONFLICT(blindbox_id, items_id, sku_id) DO UPDATE SET
+                        name = excluded.name,
+                        img_url = excluded.img_url,
+                        market_price = excluded.market_price,
+                        updated_at = excluded.updated_at
+                    """
+                ),
+                product_upsert_payload,
             )
-            session.execute(product_update_stmt, product_update_payload)
+        if c2c_upsert_payload:
+            upsert_sql_base = """
+                INSERT INTO c2c_items (
+                    c2c_items_id, category_id, type, c2c_items_name, total_items_count,
+                    price, show_price, show_market_price, uid, payment_time,
+                    is_my_publish, uface, uname, publish_status, sale_status, drop_reason,
+                    created_at, updated_at
+                )
+                VALUES (
+                    :c2c_items_id, :category_id, :type, :c2c_items_name, :total_items_count,
+                    :price, :show_price, :show_market_price, :uid, :payment_time,
+                    :is_my_publish, :uface, :uname, :publish_status, :sale_status, :drop_reason,
+                    :created_at, :updated_at
+                )
+                ON CONFLICT(c2c_items_id) DO UPDATE SET
+                    category_id = excluded.category_id,
+                    type = excluded.type,
+                    c2c_items_name = excluded.c2c_items_name,
+                    total_items_count = excluded.total_items_count,
+                    price = excluded.price,
+                    show_price = excluded.show_price,
+                    show_market_price = excluded.show_market_price,
+                    uid = excluded.uid,
+                    payment_time = excluded.payment_time,
+                    is_my_publish = excluded.is_my_publish,
+                    uface = excluded.uface,
+                    uname = excluded.uname,
+                    publish_status = excluded.publish_status,
+                    sale_status = excluded.sale_status,
+                    drop_reason = excluded.drop_reason,
+                    created_at = coalesce(c2c_items.created_at, excluded.created_at),
+                    updated_at = excluded.updated_at
+            """
+            inserted_ids: set[int] = set()
+            dialect = str(getattr(backend._engine.dialect, "name", "") or "").lower()
+            supports_returning = bool(
+                getattr(backend._engine.dialect, "insert_returning", False)
+                or getattr(backend._engine.dialect, "supports_returning", False)
+            )
+            use_returning = supports_returning or dialect in {"sqlite", "cloudflare_d1"}
+            used_returning = False
+
+            if use_returning:
+                try:
+                    returning_rows = session.execute(
+                        sa.text(
+                            upsert_sql_base
+                            + "\nRETURNING c2c_items_id, created_at"
+                        ),
+                        c2c_upsert_payload,
+                    ).all()
+                    used_returning = True
+                    for row in returning_rows:
+                        try:
+                            returned_id = int(row[0])
+                        except Exception:
+                            continue
+                        if str(row[1] or "") == timestamp_now:
+                            inserted_ids.add(returned_id)
+                except SQLAlchemyError:
+                    used_returning = False
+
+            if not used_returning:
+                session.execute(sa.text(upsert_sql_base), c2c_upsert_payload)
+                inserted_ids = set(
+                    int(row[0])
+                    for row in session.execute(
+                        select(C2CItem.c2c_items_id).where(
+                            C2CItem.c2c_items_id.in_([int(it["c2c_items_id"]) for it in c2c_upsert_payload]),
+                            C2CItem.created_at == timestamp_now,
+                        )
+                    ).all()
+                )
+            inserted = len(inserted_ids)
+            for it in items:
+                item_id = it.get("c2cItemsId")
+                if item_id is None:
+                    continue
+                try:
+                    parsed_id = int(item_id)
+                except Exception:
+                    continue
+                if parsed_id in inserted_ids:
+                    new_items_for_notify.append(it)
 
         if snapshot_candidates:
-            snapshot_payload: List[Dict[str, Any]] = []
-            for item_id, snapshot_at, product_key, est_price in snapshot_candidates:
-                product = product_by_key.get(product_key)
-                if product is None or product.id is None:
-                    continue
-                snapshot_payload.append(
-                    {
-                        "c2c_items_id": item_id,
-                        "snapshot_at": snapshot_at,
-                        "product_id": int(product.id),
-                        "est_price": est_price,
-                    }
-                )
-            if snapshot_payload:
-                session.execute(sa.insert(C2CItemSnapshot), snapshot_payload)
+            snapshot_payload: List[Dict[str, Any]] = [
+                {
+                    "c2c_items_id": item_id,
+                    "snapshot_at": snapshot_at,
+                    "blindbox_id": blindbox_id,
+                    "items_id": items_id,
+                    "sku_id": sku_id,
+                    "est_price": est_price,
+                }
+                for item_id, snapshot_at, blindbox_id, items_id, sku_id, est_price in snapshot_candidates
+            ]
+            session.execute(
+                sa.text(
+                    """
+                    INSERT INTO c2c_items_snapshot (c2c_items_id, snapshot_at, product_id, est_price)
+                    SELECT :c2c_items_id, :snapshot_at, p.id, :est_price
+                    FROM product p
+                    WHERE p.blindbox_id = :blindbox_id
+                      AND p.items_id = :items_id
+                      AND p.sku_id = :sku_id
+                    """
+                ),
+                snapshot_payload,
+            )
 
         # Phase 1 done: data rows/snapshots/products are written first (without detail_blob).
         session.flush()
@@ -2589,32 +2607,53 @@ def has_active_bili_session() -> bool:
 def mark_bili_session_result(login_username: str, error: Optional[str] = None) -> None:
     backend = _require_sqlalchemy_backend()
     with backend.session() as session:
-        row = session.scalar(
-            select(BiliSession).where(BiliSession.login_username == login_username)
-        )
-        if row is None:
-            return
         timestamp = _now()
-        row.last_checked_at = timestamp
-        row.last_error = error
-        row.updated_at = timestamp
+        session.execute(
+            sa.update(BiliSession)
+            .where(BiliSession.login_username == login_username)
+            .values(
+                last_checked_at=timestamp,
+                last_error=error,
+                updated_at=timestamp,
+            )
+        )
 
 
 def record_bili_session_fetch_success(login_username: str, fetched_count: int = 0) -> None:
     increment = max(0, int(fetched_count))
     backend = _require_sqlalchemy_backend()
     with backend.session() as session:
-        row = session.scalar(
-            select(BiliSession).where(BiliSession.login_username == login_username)
-        )
-        if row is None:
-            return
         timestamp = _now()
-        row.fetch_count = int(row.fetch_count or 0) + increment
-        row.last_success_fetch_at = timestamp
-        row.last_checked_at = timestamp
-        row.last_error = None
-        row.updated_at = timestamp
+        session.execute(
+            sa.update(BiliSession)
+            .where(BiliSession.login_username == login_username)
+            .values(
+                fetch_count=func.coalesce(BiliSession.fetch_count, 0) + increment,
+                last_success_fetch_at=timestamp,
+                last_checked_at=timestamp,
+                last_error=None,
+                updated_at=timestamp,
+            )
+        )
+
+
+def record_bili_session_scan_success(login_username: str, fetched_count: int = 0) -> None:
+    """Record a successful scan for one session with a single UPDATE round-trip."""
+    increment = max(0, int(fetched_count))
+    backend = _require_sqlalchemy_backend()
+    with backend.session() as session:
+        timestamp = _now()
+        session.execute(
+            sa.update(BiliSession)
+            .where(BiliSession.login_username == login_username)
+            .values(
+                fetch_count=func.coalesce(BiliSession.fetch_count, 0) + increment,
+                last_success_fetch_at=timestamp,
+                last_checked_at=timestamp,
+                last_error=None,
+                updated_at=timestamp,
+            )
+        )
 
 
 def delete_bili_session(login_username: str) -> None:

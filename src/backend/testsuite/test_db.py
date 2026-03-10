@@ -131,7 +131,7 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(len(item["bundled_items"]), 2)
         self.assertEqual(item["bundled_items"][0]["name"], "item A")
 
-    def test_save_items_merges_sparse_detail_fields_without_losing_existing(self) -> None:
+    def test_save_items_uses_latest_sparse_detail_payload(self) -> None:
         db.save_items(
             [
                 {
@@ -182,8 +182,8 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(len(details), 1)
         merged = details[0]
         self.assertEqual(merged.get("name"), "Original Product Renamed")
-        self.assertEqual(merged.get("imgUrl"), "https://example.com/original.png")
-        self.assertEqual(merged.get("extInfo"), {"rarity": "secret"})
+        self.assertIsNone(merged.get("imgUrl"))
+        self.assertIsNone(merged.get("extInfo"))
 
     def test_save_items_snapshot_follows_materialized_detail_set(self) -> None:
         db.save_items(
@@ -200,7 +200,7 @@ class DatabaseTestCase(unittest.TestCase):
                 }
             ]
         )
-        # Second save only sends one row; materialized detail set should still include both.
+        # Second save only sends one row; snapshot follows latest payload.
         db.save_items(
             [
                 {
@@ -229,7 +229,7 @@ class DatabaseTestCase(unittest.TestCase):
                 .filter(C2CItemSnapshot.c2c_items_id == 9102, C2CItemSnapshot.snapshot_at == latest_ts)
                 .count()
             )
-        self.assertEqual(latest_count, 2)
+        self.assertEqual(latest_count, 1)
 
     def test_get_recent_15d_listings_sort_by(self) -> None:
         db.save_items(
@@ -436,8 +436,8 @@ class DatabaseTestCase(unittest.TestCase):
             snapshot_rows = session.query(C2CItemSnapshot).filter(C2CItemSnapshot.c2c_items_id == 4101).all()
         self.assertEqual(
             len(snapshot_rows),
-            4,
-            "Snapshot writes should be append-only and follow the materialized detail set",
+            3,
+            "Snapshot writes should be append-only and follow the latest payload detail set",
         )
 
         listings, _, _ = db.get_recent_15d_listings(61, page=1, limit=10, sort_by="TIME_DESC")
@@ -445,8 +445,8 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(listings[0]["c2c_items_id"], 4101)
         self.assertEqual(
             listings[0]["show_est_price"],
-            "10.00",
-            "Estimations should follow the latest materialized detail distribution",
+            "100.00",
+            "Estimations should follow the latest payload detail distribution",
         )
 
     def test_database_backend_uses_sqlalchemy_for_sqlite(self) -> None:
