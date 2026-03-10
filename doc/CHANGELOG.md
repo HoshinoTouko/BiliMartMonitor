@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.9.5.6] — 2026-03-10
+
+### Performance
+
+- **D1 Batch Write Optimization**: Replaced raw `sa.text()` SQL in `save_items_data_phase` with SQLAlchemy Core constructs (`sqlite_insert().values().on_conflict_do_update()`). The D1 DBAPI's `executemany()` was sending one HTTP request per row (~80-100ms each); multi-row `insert().values(list)` now sends a single request per operation. Total HTTP round-trips per scan page reduced from ~90 to ~4, expected write time from ~7s to ~300ms.
+  - Product upsert: `sqlite_insert(Product).values(list).on_conflict_do_update()`
+  - C2C items upsert: `sqlite_insert(C2CItem).values(list).on_conflict_do_update().returning()`
+  - Snapshot insert: batch `select(Product.id)` lookup + `insert(C2CItemSnapshot).values(list)`
+
+### Changed
+
+- **Backend App Version**: Updated FastAPI app version to `0.9.5.6`.
+- **Frontend Version Bump**: Updated frontend/app version to `0.9.5.6`.
+
+### Tests
+
+- Verified suites (80 passed):
+  - `src/backend/testsuite/test_db.py`
+  - `src/backend/testsuite/test_market_api.py`
+  - `src/backend/testsuite/test_market_router.py`
+  - `src/backend/testsuite/test_cron_runner.py`
+
 ## [0.9.5.5] — 2026-03-10
 
 ### Changed

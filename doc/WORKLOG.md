@@ -1,5 +1,26 @@
 # Work Log
 
+## 2026-03-10 D1 Batch Write Performance: SQLAlchemy Core Migration
+
+### Planned
+
+- Identify root cause of slow D1 write operations (~7s per scan page).
+- Replace raw SQL `executemany` paths with SQLAlchemy Core multi-row insert constructs.
+
+### Step Log
+
+1. Identified root cause: D1 DBAPI `executemany()` sends one HTTP request per parameter set (~80-100ms each), resulting in ~90 HTTP round-trips for 3 batch operations × ~30 rows.
+2. Confirmed D1 dialect declares `supports_multivalues_insert = True`, enabling SQLAlchemy Core `insert().values(list)` to generate single multi-row VALUES statements.
+3. Replaced product upsert in `src/bsm/db.py` from `sa.text(INSERT...ON CONFLICT)` + list to `sqlite_insert(Product).values(list).on_conflict_do_update()`.
+4. Replaced C2C items upsert from `sa.text()` + list to `sqlite_insert(C2CItem).values(list).on_conflict_do_update()` with `.returning()` for inserted-item detection.
+5. Replaced snapshot insert from per-row `sa.text(INSERT...SELECT FROM product)` to two-step: batch `select(Product.id)` lookup + `insert(C2CItemSnapshot).values(list)`.
+6. Fixed import: `coalesce` is not a top-level SQLAlchemy export, used `func.coalesce()` instead.
+7. Bumped version to `0.9.5.6` in `package.json`, `appInfo.ts`, `main.py`.
+
+### Verification
+
+- `pytest testsuite/test_db.py testsuite/test_market_api.py testsuite/test_market_router.py testsuite/test_cron_runner.py` → 80 passed
+
 ## 2026-03-10 Scan Trace ID, Async BLOB Queue, and Full Batch Write Path
 
 ### Planned

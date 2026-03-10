@@ -8,6 +8,7 @@ import unittest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import update
+from unittest.mock import patch
 
 
 PROJECT_ROOT = os.path.abspath(
@@ -92,6 +93,26 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(total_count, 1)
         self.assertEqual(total_pages, 1)
         self.assertEqual(items[0]["id"], 1001)
+
+    def test_inserted_detection_remains_correct_when_cloudflare_returning_is_verified(self) -> None:
+        payload = {
+            "c2cItemsId": 81101,
+            "c2cItemsName": "Inserted Detection",
+            "price": 10000,
+            "showPrice": "100.00",
+            "detailDtoList": [{"itemsId": 99101, "skuId": 88101, "blindBoxId": 77101, "marketPrice": 10000}],
+        }
+        with patch("bsm.db.get_db_backend_name", return_value="cloudflare"):
+            saved_1, inserted_1 = db.save_items([payload])
+            payload_updated = dict(payload)
+            payload_updated["price"] = 9900
+            payload_updated["showPrice"] = "99.00"
+            saved_2, inserted_2 = db.save_items([payload_updated])
+
+        self.assertEqual(saved_1, 1)
+        self.assertEqual(inserted_1, 1)
+        self.assertEqual(saved_2, 1)
+        self.assertEqual(inserted_2, 0)
 
     def test_save_items_normalizes_default_noface_uface(self) -> None:
         db.save_items(

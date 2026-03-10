@@ -485,8 +485,7 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
         list_bili_sessions,
         save_items_data_phase,
         flush_pending_blob_updates,
-        record_bili_session_scan_success,
-        mark_bili_session_result,
+        apply_bili_session_scan_results,
     )
     from bsm.scan import scan_once, scan_once_async, ScanRateLimitedError
     from bsm.notify import load_notifier, send_admin_telegram_alert
@@ -580,6 +579,7 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
                     "saved": int(save_result.get("saved") or 0),
                     "inserted": int(save_result.get("inserted") or 0),
                     "db_duration_ms": int(save_result.get("data_write_ms") or 0),
+                    "db_breakdown": dict(save_result.get("data_phase_breakdown") or {}),
                     "blob_write_count": int(save_result.get("blob_write_count") or 0),
                     "pending_blob_updates": list(save_result.get("pending_blob_updates") or []),
                     "blob_backend_name": str(save_result.get("backend_name") or ""),
@@ -639,6 +639,7 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
             saved = int(db_result.get("saved") or 0)
             inserted = int(db_result.get("inserted") or 0)
             db_duration_ms = int(db_result.get("db_duration_ms") or 0)
+            db_breakdown = dict(db_result.get("db_breakdown") or {})
             blob_write_count = int(db_result.get("blob_write_count") or 0)
             total_duration_ms = duration_ms + db_duration_ms
             total_count += len(items)
@@ -706,9 +707,12 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
                     f"BLOB写入已排队 | 分类 {_category_label(category)} | 第 {page} 页 | 条数 {blob_write_count} | 队列任务 {blob_queued} | 运行并发 {_BLOB_RUNNING_COUNT}/{_BLOB_WRITE_MAX_CONCURRENCY} | 追踪ID {trace_id}"
                 )
 
-            should_reset_on_repeat = mode == "continue_until_repeat" and len(new_items) < len(items)
+            # Repeat detection should use persisted rows, not raw API rows.
+            # Raw payload may include malformed/unpersistable entries.
+            repeat_compare_count = saved if saved > 0 else len(items)
+            should_reset_on_repeat = mode == "continue_until_repeat" and len(new_items) < repeat_compare_count
             did_reset_cursor = False
-            first_page_repeat = page == 1 and len(new_items) < len(items)
+            first_page_repeat = page == 1 and len(new_items) < repeat_compare_count
             if continue_like_mode:
                 active_state = _get_category_state(category)
                 next_page_count = int(active_state["page_count"]) + 1
@@ -740,6 +744,16 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
             _log_exec(
                 f"扫描完成 | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | {len(items)} 条 | 新增 {inserted} 条 | 耗时 API {duration_ms} ms | DB {db_duration_ms} ms | 追踪ID {trace_id}"
             )
+            if db_breakdown:
+                prepare_ms = int(db_breakdown.get("prepare_payload_ms") or 0)
+                product_ms = int(db_breakdown.get("product_upsert_ms") or 0)
+                c2c_upsert_ms = int(db_breakdown.get("c2c_upsert_ms") or 0)
+                inserted_detect_ms = int(db_breakdown.get("c2c_inserted_detect_ms") or 0)
+                snapshot_ms = int(db_breakdown.get("snapshot_insert_ms") or 0)
+                detect_mode = str(db_breakdown.get("c2c_inserted_detect_mode") or "none")
+                _log_exec(
+                    f"DB打点 | 分类 {_category_label(category)} | 第 {page} 页 | prepare {prepare_ms} ms | product_upsert {product_ms} ms | c2c_upsert {c2c_upsert_ms} ms | inserted_detect[{detect_mode}] {inserted_detect_ms} ms | snapshot_insert {snapshot_ms} ms | 总计 {db_duration_ms} ms | 追踪ID {trace_id}"
+                )
             _log_wait(f"下次扫描 | 分类 {_category_label(category)} | 第 {_mode_page(mode, category)} 页 | 追踪ID {trace_id}")
             if username and username not in session_errors:
                 session_success_count[username] = session_success_count.get(username, 0) + len(items)
@@ -753,12 +767,15 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
                 continue
             if int(fetched_count or 0) <= 0 and not session_had_error_before.get(username, False):
                 continue
-            await asyncio.to_thread(record_bili_session_scan_success, username, fetched_count=fetched_count)
             _update_cached_session_scan_result(username, error=None, fetched_count=int(fetched_count or 0))
         for username, error in session_errors.items():
             if username:
-                await asyncio.to_thread(mark_bili_session_result, username, error)
                 _update_cached_session_scan_result(username, error=error)
+        await asyncio.to_thread(
+            apply_bili_session_scan_results,
+            {k: int(v or 0) for k, v in session_success_count.items()},
+            {k: str(v or "") for k, v in session_errors.items()},
+        )
         if any(_is_session_failure_error(err) for err in session_errors.values()):
             await asyncio.to_thread(_refresh_session_cache, list_bili_sessions)
 

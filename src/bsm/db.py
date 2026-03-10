@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import sqlalchemy as sa
-from sqlalchemy import and_, case, create_engine, delete, event, func, literal, or_, select, true
+from sqlalchemy import and_, case, create_engine, delete, event, func, insert, literal, or_, select, true, tuple_
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, aliased, sessionmaker
@@ -198,10 +199,11 @@ class SqlalchemyBackend(DatabaseBackend):
             if dir_name:
                 os.makedirs(dir_name, exist_ok=True)
         connect_args = {"check_same_thread": False} if self.db_url.startswith("sqlite:///") else {}
+        pool_pre_ping_enabled = not (self._is_sqlite() or self.db_url.startswith("cloudflare_d1://"))
         self._engine = create_engine(
             self.db_url,
             connect_args=connect_args,
-            pool_pre_ping=not self._is_sqlite(),
+            pool_pre_ping=pool_pre_ping_enabled,
         )
         if self._is_sqlite():
             @event.listens_for(self._engine, "connect")
@@ -1585,6 +1587,12 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     blob_write_count = 0
     data_write_started_at = time.perf_counter()
     data_write_ms = 0
+    prepare_payload_ms = 0
+    product_upsert_ms = 0
+    c2c_upsert_ms = 0
+    c2c_inserted_detect_ms = 0
+    snapshot_insert_ms = 0
+    c2c_inserted_detect_mode = "none"
 
     with backend.session() as session:
         pending_detail_blob_updates: List[Tuple[int, bytes, str]] = []
@@ -1592,6 +1600,7 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         c2c_upsert_payload: List[Dict[str, Any]] = []
         new_items_for_notify: List[Dict[str, Any]] = []
         timestamp_now = _now()
+        prepare_started_at = time.perf_counter()
 
         for it in items:
             item_id = it.get("c2cItemsId")
@@ -1685,6 +1694,7 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                 )
             except Exception:
                 continue
+        prepare_payload_ms = int((time.perf_counter() - prepare_started_at) * 1000)
 
         product_latest_fields: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
         snapshot_candidates: List[Tuple[int, str, int, int, int, Optional[int]]] = []
@@ -1736,57 +1746,43 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                         "updated_at": updated_at,
                     }
                 )
-            session.execute(
-                sa.text(
-                    """
-                    INSERT INTO product (
-                        blindbox_id, items_id, sku_id, name, img_url, market_price, created_at, updated_at
-                    )
-                    VALUES (
-                        :blindbox_id, :items_id, :sku_id, :name, :img_url, :market_price, :created_at, :updated_at
-                    )
-                    ON CONFLICT(blindbox_id, items_id, sku_id) DO UPDATE SET
-                        name = excluded.name,
-                        img_url = excluded.img_url,
-                        market_price = excluded.market_price,
-                        updated_at = excluded.updated_at
-                    """
-                ),
-                product_upsert_payload,
+            product_upsert_started_at = time.perf_counter()
+            product_stmt = sqlite_insert(Product).values(product_upsert_payload)
+            product_stmt = product_stmt.on_conflict_do_update(
+                index_elements=["blindbox_id", "items_id", "sku_id"],
+                set_={
+                    "name": product_stmt.excluded.name,
+                    "img_url": product_stmt.excluded.img_url,
+                    "market_price": product_stmt.excluded.market_price,
+                    "updated_at": product_stmt.excluded.updated_at,
+                },
             )
+            session.execute(product_stmt)
+            product_upsert_ms = int((time.perf_counter() - product_upsert_started_at) * 1000)
         if c2c_upsert_payload:
-            upsert_sql_base = """
-                INSERT INTO c2c_items (
-                    c2c_items_id, category_id, type, c2c_items_name, total_items_count,
-                    price, show_price, show_market_price, uid, payment_time,
-                    is_my_publish, uface, uname, publish_status, sale_status, drop_reason,
-                    created_at, updated_at
-                )
-                VALUES (
-                    :c2c_items_id, :category_id, :type, :c2c_items_name, :total_items_count,
-                    :price, :show_price, :show_market_price, :uid, :payment_time,
-                    :is_my_publish, :uface, :uname, :publish_status, :sale_status, :drop_reason,
-                    :created_at, :updated_at
-                )
-                ON CONFLICT(c2c_items_id) DO UPDATE SET
-                    category_id = excluded.category_id,
-                    type = excluded.type,
-                    c2c_items_name = excluded.c2c_items_name,
-                    total_items_count = excluded.total_items_count,
-                    price = excluded.price,
-                    show_price = excluded.show_price,
-                    show_market_price = excluded.show_market_price,
-                    uid = excluded.uid,
-                    payment_time = excluded.payment_time,
-                    is_my_publish = excluded.is_my_publish,
-                    uface = excluded.uface,
-                    uname = excluded.uname,
-                    publish_status = excluded.publish_status,
-                    sale_status = excluded.sale_status,
-                    drop_reason = excluded.drop_reason,
-                    created_at = coalesce(c2c_items.created_at, excluded.created_at),
-                    updated_at = excluded.updated_at
-            """
+            c2c_stmt = sqlite_insert(C2CItem).values(c2c_upsert_payload)
+            c2c_stmt = c2c_stmt.on_conflict_do_update(
+                index_elements=["c2c_items_id"],
+                set_={
+                    "category_id": c2c_stmt.excluded.category_id,
+                    "type": c2c_stmt.excluded.type,
+                    "c2c_items_name": c2c_stmt.excluded.c2c_items_name,
+                    "total_items_count": c2c_stmt.excluded.total_items_count,
+                    "price": c2c_stmt.excluded.price,
+                    "show_price": c2c_stmt.excluded.show_price,
+                    "show_market_price": c2c_stmt.excluded.show_market_price,
+                    "uid": c2c_stmt.excluded.uid,
+                    "payment_time": c2c_stmt.excluded.payment_time,
+                    "is_my_publish": c2c_stmt.excluded.is_my_publish,
+                    "uface": c2c_stmt.excluded.uface,
+                    "uname": c2c_stmt.excluded.uname,
+                    "publish_status": c2c_stmt.excluded.publish_status,
+                    "sale_status": c2c_stmt.excluded.sale_status,
+                    "drop_reason": c2c_stmt.excluded.drop_reason,
+                    "created_at": func.coalesce(C2CItem.created_at, c2c_stmt.excluded.created_at),
+                    "updated_at": c2c_stmt.excluded.updated_at,
+                },
+            )
             inserted_ids: set[int] = set()
             dialect = str(getattr(backend._engine.dialect, "name", "") or "").lower()
             supports_returning = bool(
@@ -1796,16 +1792,15 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             use_returning = supports_returning or dialect in {"sqlite", "cloudflare_d1"}
             used_returning = False
 
+            c2c_upsert_started_at = time.perf_counter()
             if use_returning:
                 try:
-                    returning_rows = session.execute(
-                        sa.text(
-                            upsert_sql_base
-                            + "\nRETURNING c2c_items_id, created_at"
-                        ),
-                        c2c_upsert_payload,
-                    ).all()
+                    c2c_returning_stmt = c2c_stmt.returning(
+                        C2CItem.c2c_items_id, C2CItem.created_at
+                    )
+                    returning_rows = session.execute(c2c_returning_stmt).all()
                     used_returning = True
+                    c2c_inserted_detect_mode = "returning"
                     for row in returning_rows:
                         try:
                             returned_id = int(row[0])
@@ -1817,8 +1812,15 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                     used_returning = False
 
             if not used_returning:
-                session.execute(sa.text(upsert_sql_base), c2c_upsert_payload)
-                inserted_ids = set(
+                session.execute(c2c_stmt)
+            c2c_upsert_ms = int((time.perf_counter() - c2c_upsert_started_at) * 1000)
+            inserted_detect_started_at = time.perf_counter()
+            should_verify_with_select = (
+                used_returning
+                and backend_name == "cloudflare"
+            )
+            if (not used_returning) or should_verify_with_select:
+                verified_inserted_ids = set(
                     int(row[0])
                     for row in session.execute(
                         select(C2CItem.c2c_items_id).where(
@@ -1827,6 +1829,17 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                         )
                     ).all()
                 )
+                if used_returning:
+                    # Cloudflare D1 may return created_at in a different text format.
+                    # Keep RETURNING-based inserts and only add verified rows from SELECT.
+                    inserted_ids |= verified_inserted_ids
+                else:
+                    inserted_ids = verified_inserted_ids
+                if not used_returning:
+                    c2c_inserted_detect_mode = "fallback_select"
+                else:
+                    c2c_inserted_detect_mode = "returning_verify_select"
+            c2c_inserted_detect_ms = int((time.perf_counter() - inserted_detect_started_at) * 1000)
             inserted = len(inserted_ids)
             for it in items:
                 item_id = it.get("c2cItemsId")
@@ -1840,30 +1853,43 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                     new_items_for_notify.append(it)
 
         if snapshot_candidates:
-            snapshot_payload: List[Dict[str, Any]] = [
-                {
-                    "c2c_items_id": item_id,
-                    "snapshot_at": snapshot_at,
-                    "blindbox_id": blindbox_id,
-                    "items_id": items_id,
-                    "sku_id": sku_id,
+            snapshot_insert_started_at = time.perf_counter()
+            # Step 1: batch-resolve (blindbox_id, items_id, sku_id) → product.id
+            product_keys_needed: set[Tuple[int, int, int]] = set()
+            for _, _, blindbox_id, items_id, sku_id, _ in snapshot_candidates:
+                product_keys_needed.add((int(blindbox_id), int(items_id), int(sku_id)))
+            product_id_map: Dict[Tuple[int, int, int], int] = {}
+            if product_keys_needed:
+                product_id_rows = session.execute(
+                    select(
+                        Product.id, Product.blindbox_id, Product.items_id, Product.sku_id
+                    ).where(
+                        tuple_(
+                            Product.blindbox_id, Product.items_id, Product.sku_id
+                        ).in_(list(product_keys_needed))
+                    )
+                ).all()
+                for pid, bid, iid, sid in product_id_rows:
+                    product_id_map[(int(bid), int(iid), int(sid))] = int(pid)
+            # Step 2: build snapshot rows with resolved product_id
+            snapshot_rows: List[Dict[str, Any]] = []
+            for item_id, snapshot_at, blindbox_id, items_id, sku_id, est_price in snapshot_candidates:
+                resolved_pid = product_id_map.get(
+                    (int(blindbox_id), int(items_id), int(sku_id))
+                )
+                if resolved_pid is None:
+                    continue
+                snapshot_rows.append({
+                    "c2c_items_id": int(item_id),
+                    "snapshot_at": str(snapshot_at),
+                    "product_id": resolved_pid,
                     "est_price": est_price,
-                }
-                for item_id, snapshot_at, blindbox_id, items_id, sku_id, est_price in snapshot_candidates
-            ]
-            session.execute(
-                sa.text(
-                    """
-                    INSERT INTO c2c_items_snapshot (c2c_items_id, snapshot_at, product_id, est_price)
-                    SELECT :c2c_items_id, :snapshot_at, p.id, :est_price
-                    FROM product p
-                    WHERE p.blindbox_id = :blindbox_id
-                      AND p.items_id = :items_id
-                      AND p.sku_id = :sku_id
-                    """
-                ),
-                snapshot_payload,
-            )
+                })
+            if snapshot_rows:
+                session.execute(
+                    insert(C2CItemSnapshot).values(snapshot_rows)
+                )
+            snapshot_insert_ms = int((time.perf_counter() - snapshot_insert_started_at) * 1000)
 
         # Phase 1 done: data rows/snapshots/products are written first (without detail_blob).
         session.flush()
@@ -1878,6 +1904,14 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         "blob_write_count": int(blob_write_count),
         "pending_blob_updates": pending_detail_blob_updates,
         "new_items": new_items_for_notify,
+        "data_phase_breakdown": {
+            "prepare_payload_ms": int(prepare_payload_ms),
+            "product_upsert_ms": int(product_upsert_ms),
+            "c2c_upsert_ms": int(c2c_upsert_ms),
+            "c2c_inserted_detect_ms": int(c2c_inserted_detect_ms),
+            "snapshot_insert_ms": int(snapshot_insert_ms),
+            "c2c_inserted_detect_mode": c2c_inserted_detect_mode,
+        },
     }
 
 
@@ -2654,6 +2688,47 @@ def record_bili_session_scan_success(login_username: str, fetched_count: int = 0
                 updated_at=timestamp,
             )
         )
+
+
+def apply_bili_session_scan_results(
+    success_fetch_counts: Dict[str, int],
+    error_by_user: Dict[str, str],
+) -> None:
+    """Apply one scan round session updates in a single DB session."""
+    backend = _require_sqlalchemy_backend()
+    with backend.session() as session:
+        for username, fetched_count in (success_fetch_counts or {}).items():
+            login_username = str(username or "").strip()
+            if not login_username or login_username in (error_by_user or {}):
+                continue
+            increment = max(0, int(fetched_count or 0))
+            timestamp = _now()
+            session.execute(
+                sa.update(BiliSession)
+                .where(BiliSession.login_username == login_username)
+                .values(
+                    fetch_count=func.coalesce(BiliSession.fetch_count, 0) + increment,
+                    last_success_fetch_at=timestamp,
+                    last_checked_at=timestamp,
+                    last_error=None,
+                    updated_at=timestamp,
+                )
+            )
+
+        for username, error in (error_by_user or {}).items():
+            login_username = str(username or "").strip()
+            if not login_username:
+                continue
+            timestamp = _now()
+            session.execute(
+                sa.update(BiliSession)
+                .where(BiliSession.login_username == login_username)
+                .values(
+                    last_checked_at=timestamp,
+                    last_error=str(error or ""),
+                    updated_at=timestamp,
+                )
+            )
 
 
 def delete_bili_session(login_username: str) -> None:

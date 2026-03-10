@@ -93,8 +93,7 @@ class CronRunnerTestCase(unittest.TestCase):
 
     @patch("bsm.notify.load_notifier")
     @patch("bsm.scan.scan_once_async", new_callable=AsyncMock)
-    @patch("bsm.db.mark_bili_session_result")
-    @patch("bsm.db.record_bili_session_scan_success")
+    @patch("bsm.db.apply_bili_session_scan_results")
     @patch("bsm.db.save_items_data_phase")
     @patch("bsm.db.list_bili_sessions")
     @patch("bsm.settings.load_runtime_config")
@@ -103,8 +102,7 @@ class CronRunnerTestCase(unittest.TestCase):
         mock_load_runtime_config: MagicMock,
         mock_list_bili_sessions: MagicMock,
         mock_save_items_data_phase: MagicMock,
-        mock_record_fetch: MagicMock,
-        mock_mark_result: MagicMock,
+        mock_apply_scan_results: MagicMock,
         mock_scan_once: MagicMock,
         mock_load_notifier: MagicMock,
     ) -> None:
@@ -146,8 +144,7 @@ class CronRunnerTestCase(unittest.TestCase):
         self.assertEqual(cron_runner._CATEGORY_SCAN_STATE["2312"]["page_count"], 0)
         self.assertEqual(notifier.notify_batch.call_args_list[0].args[0], first_items)
         self.assertEqual(notifier.notify_batch.call_args_list[1].args[0], second_items)
-        self.assertEqual(mock_record_fetch.call_count, 2)
-        self.assertEqual(mock_mark_result.call_count, 0)
+        self.assertEqual(mock_apply_scan_results.call_count, 2)
         info_messages = [call.args[0] for call in mock_info.call_args_list]
         self.assertTrue(any("开始扫描 | 账号 tester | 分类 手办 | 模式 continue | 第 " in message for message in info_messages))
         self.assertTrue(any("扫描完成 | 分类 手办 | 模式 continue | 第 " in message and "| 2 条 | 新增 1 条" in message for message in info_messages))
@@ -156,8 +153,7 @@ class CronRunnerTestCase(unittest.TestCase):
 
     @patch("bsm.notify.load_notifier")
     @patch("bsm.scan.scan_once_async", new_callable=AsyncMock)
-    @patch("bsm.db.mark_bili_session_result")
-    @patch("bsm.db.record_bili_session_scan_success")
+    @patch("bsm.db.apply_bili_session_scan_results")
     @patch("bsm.db.save_items_data_phase")
     @patch("bsm.db.list_bili_sessions")
     @patch("bsm.settings.load_runtime_config")
@@ -166,8 +162,7 @@ class CronRunnerTestCase(unittest.TestCase):
         mock_load_runtime_config: MagicMock,
         mock_list_bili_sessions: MagicMock,
         mock_save_items_data_phase: MagicMock,
-        mock_record_fetch: MagicMock,
-        mock_mark_result: MagicMock,
+        mock_apply_scan_results: MagicMock,
         mock_scan_once: MagicMock,
         mock_load_notifier: MagicMock,
     ) -> None:
@@ -206,8 +201,7 @@ class CronRunnerTestCase(unittest.TestCase):
         self.assertEqual(cron_runner._CATEGORY_SCAN_STATE["2312"]["next_id"], None)
         self.assertEqual(cron_runner._CATEGORY_SCAN_STATE["2312"]["page_count"], 0)
         self.assertEqual(notifier.notify_batch.call_args.args[0], [items[0]])
-        self.assertEqual(mock_record_fetch.call_count, 1)
-        self.assertEqual(mock_mark_result.call_count, 0)
+        self.assertEqual(mock_apply_scan_results.call_count, 1)
         info_messages = [call.args[0] for call in mock_info.call_args_list]
         self.assertTrue(any("开始扫描 | 账号 tester | 分类 手办 | 模式 CUR | 第 1 页" in message for message in info_messages))
         self.assertTrue(any("扫描完成 | 分类 手办 | 模式 CUR | 第 1 页 | 2 条 | 新增 1 条" in message for message in info_messages))
@@ -216,8 +210,56 @@ class CronRunnerTestCase(unittest.TestCase):
 
     @patch("bsm.notify.load_notifier")
     @patch("bsm.scan.scan_once_async", new_callable=AsyncMock)
-    @patch("bsm.db.mark_bili_session_result")
-    @patch("bsm.db.record_bili_session_scan_success")
+    @patch("bsm.db.apply_bili_session_scan_results")
+    @patch("bsm.db.save_items_data_phase")
+    @patch("bsm.db.list_bili_sessions")
+    @patch("bsm.settings.load_runtime_config")
+    def test_cur_does_not_reset_when_unpersistable_rows_exist_but_saved_rows_are_all_new(
+        self,
+        mock_load_runtime_config: MagicMock,
+        mock_list_bili_sessions: MagicMock,
+        mock_save_items_data_phase: MagicMock,
+        mock_apply_scan_results: MagicMock,
+        mock_scan_once: MagicMock,
+        mock_load_notifier: MagicMock,
+    ) -> None:
+        mock_load_runtime_config.return_value = {
+            "interval": 60,
+            "scan_mode": "continue_until_repeat",
+            "category": "2312",
+            "sort_type": "TIME_DESC",
+            "notify": {},
+        }
+        mock_list_bili_sessions.return_value = [{
+            "cookies": "cookie",
+            "login_username": "tester",
+            "status": "active",
+            "last_error": None,
+            "last_checked_at": None,
+        }]
+        items = [{"c2cItemsId": 1}, {"invalid": True}]
+        mock_scan_once.return_value = ("cursor-2", items)
+        mock_save_items_data_phase.return_value = {
+            "saved": 1,
+            "inserted": 1,
+            "data_write_ms": 1,
+            "blob_write_ms": 0,
+            "blob_write_count": 1,
+            "new_items": [items[0]],
+        }
+        notifier = MagicMock()
+        mock_load_notifier.return_value = notifier
+
+        result = asyncio.run(cron_runner._run_scan_once())
+
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(cron_runner._CATEGORY_SCAN_STATE["2312"]["next_id"], "cursor-2")
+        self.assertEqual(cron_runner._CATEGORY_SCAN_STATE["2312"]["page_count"], 1)
+        self.assertEqual(mock_apply_scan_results.call_count, 1)
+
+    @patch("bsm.notify.load_notifier")
+    @patch("bsm.scan.scan_once_async", new_callable=AsyncMock)
+    @patch("bsm.db.apply_bili_session_scan_results")
     @patch("bsm.db.save_items_data_phase")
     @patch("bsm.db.list_bili_sessions")
     @patch("bsm.settings.load_runtime_config")
@@ -226,8 +268,7 @@ class CronRunnerTestCase(unittest.TestCase):
         mock_load_runtime_config: MagicMock,
         mock_list_bili_sessions: MagicMock,
         mock_save_items_data_phase: MagicMock,
-        mock_record_fetch: MagicMock,
-        mock_mark_result: MagicMock,
+        mock_apply_scan_results: MagicMock,
         mock_scan_once: MagicMock,
         mock_load_notifier: MagicMock,
     ) -> None:
@@ -282,8 +323,7 @@ class CronRunnerTestCase(unittest.TestCase):
 
     @patch("bsm.notify.load_notifier")
     @patch("bsm.scan.scan_once_async", new_callable=AsyncMock)
-    @patch("bsm.db.mark_bili_session_result")
-    @patch("bsm.db.record_bili_session_scan_success")
+    @patch("bsm.db.apply_bili_session_scan_results")
     @patch("bsm.db.save_items_data_phase")
     @patch("bsm.db.list_bili_sessions")
     @patch("bsm.settings.load_runtime_config")
@@ -292,8 +332,7 @@ class CronRunnerTestCase(unittest.TestCase):
         mock_load_runtime_config: MagicMock,
         mock_list_bili_sessions: MagicMock,
         mock_save_items_data_phase: MagicMock,
-        mock_record_fetch: MagicMock,
-        mock_mark_result: MagicMock,
+        mock_apply_scan_results: MagicMock,
         mock_scan_once: MagicMock,
         mock_load_notifier: MagicMock,
     ) -> None:
@@ -337,8 +376,7 @@ class CronRunnerTestCase(unittest.TestCase):
 
     @patch("bsm.notify.load_notifier")
     @patch("bsm.scan.scan_once_async", new_callable=AsyncMock)
-    @patch("bsm.db.mark_bili_session_result")
-    @patch("bsm.db.record_bili_session_scan_success")
+    @patch("bsm.db.apply_bili_session_scan_results")
     @patch("bsm.db.save_items_data_phase")
     @patch("bsm.db.list_bili_sessions")
     @patch("bsm.settings.load_runtime_config")
@@ -347,8 +385,7 @@ class CronRunnerTestCase(unittest.TestCase):
         mock_load_runtime_config: MagicMock,
         mock_list_bili_sessions: MagicMock,
         mock_save_items_data_phase: MagicMock,
-        mock_record_fetch: MagicMock,
-        mock_mark_result: MagicMock,
+        mock_apply_scan_results: MagicMock,
         mock_scan_once: MagicMock,
         mock_load_notifier: MagicMock,
     ) -> None:
@@ -401,8 +438,7 @@ class CronRunnerTestCase(unittest.TestCase):
         self.assertLess(elapsed, 0.2)
         self.assertEqual(finalized["inserted"], 1)
         self.assertEqual(finalized["count"], 1)
-        self.assertEqual(mock_record_fetch.call_count, 1)
-        self.assertEqual(mock_mark_result.call_count, 0)
+        self.assertEqual(mock_apply_scan_results.call_count, 1)
         self.assertEqual(notifier.notify_batch.call_count, 1)
 
     def test_cron_loop_counts_interval_from_dispatch_time(self) -> None:
@@ -431,8 +467,7 @@ class CronRunnerTestCase(unittest.TestCase):
     @patch("backend.cron_runner._refresh_session_cache")
     @patch("bsm.notify.load_notifier")
     @patch("bsm.scan.scan_once_async", new_callable=AsyncMock)
-    @patch("bsm.db.mark_bili_session_result")
-    @patch("bsm.db.record_bili_session_scan_success")
+    @patch("bsm.db.apply_bili_session_scan_results")
     @patch("bsm.db.save_items_data_phase")
     @patch("bsm.db.list_bili_sessions")
     @patch("bsm.settings.load_runtime_config")
@@ -441,8 +476,7 @@ class CronRunnerTestCase(unittest.TestCase):
         mock_load_runtime_config: MagicMock,
         mock_list_bili_sessions: MagicMock,
         mock_save_items_data_phase: MagicMock,
-        mock_record_fetch: MagicMock,
-        mock_mark_result: MagicMock,
+        mock_apply_scan_results: MagicMock,
         mock_scan_once: MagicMock,
         mock_load_notifier: MagicMock,
         mock_refresh_session_cache: MagicMock,
@@ -476,7 +510,7 @@ class CronRunnerTestCase(unittest.TestCase):
 
         asyncio.run(cron_runner._run_scan_once())
 
-        self.assertEqual(mock_mark_result.call_count, 1)
+        self.assertEqual(mock_apply_scan_results.call_count, 1)
         self.assertEqual(mock_refresh_session_cache.call_count, 1)
 
 
