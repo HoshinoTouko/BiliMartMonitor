@@ -4,10 +4,12 @@
 
 ### Performance
 
-- **D1 Batch Write Optimization**: Replaced raw `sa.text()` SQL in `save_items_data_phase` with SQLAlchemy Core constructs (`sqlite_insert().values().on_conflict_do_update()`). The D1 DBAPI's `executemany()` was sending one HTTP request per row (~80-100ms each); multi-row `insert().values(list)` now sends a single request per operation. Total HTTP round-trips per scan page reduced from ~90 to ~4, expected write time from ~7s to ~300ms.
+- **D1 Batch Write Optimization**: Replaced raw `sa.text()` SQL in `save_items_data_phase` with SQLAlchemy Core constructs (`sqlite_insert().values().on_conflict_do_update()`). The D1 DBAPI's `executemany()` was sending one HTTP request per row (~80-100ms each); multi-row `insert().values(list)` now sends a single request per operation. Total HTTP round-trips per scan page reduced from ~90 to ~10, expected write time from ~7s to ~1s.
   - Product upsert: `sqlite_insert(Product).values(list).on_conflict_do_update()`
   - C2C items upsert: `sqlite_insert(C2CItem).values(list).on_conflict_do_update().returning()`
   - Snapshot insert: batch `select(Product.id)` lookup + `insert(C2CItemSnapshot).values(list)`
+- **D1 SQL Variable Limit Chunking**: Added `_D1_MAX_PARAMS = 100` guard to split multi-row inserts into chunks that stay within D1's 100 bind-parameter limit per query (product: 12 rows/chunk, c2c_items: 5 rows/chunk, snapshots: 25 rows/chunk).
+- **Inserted Detection Without Verify-Select**: Updated C2C inserted-item detection to use `RETURNING (c2c_items_id, created_at, updated_at)` row comparison (`created_at == updated_at`) instead of Cloudflare-only post-upsert verify select, reducing one extra detection query while keeping insert/update distinction.
 
 ### Changed
 
@@ -21,6 +23,8 @@
   - `src/backend/testsuite/test_market_api.py`
   - `src/backend/testsuite/test_market_router.py`
   - `src/backend/testsuite/test_cron_runner.py`
+- Added regression coverage for Cloudflare inserted detection mode:
+  - `test_inserted_detection_mode_is_returning_for_cloudflare_path`
 
 ## [0.9.5.5] — 2026-03-10
 

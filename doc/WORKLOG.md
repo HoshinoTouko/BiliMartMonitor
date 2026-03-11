@@ -1,5 +1,23 @@
 # Work Log
 
+## 2026-03-11 Cloudflare Inserted Detection: Returning Row Comparison
+
+### Planned
+
+- Remove Cloudflare post-upsert verify select for inserted detection.
+- Keep inserted/new-item notification correctness while reducing one DB round-trip.
+
+### Step Log
+
+1. Updated C2C upsert returning payload in `src/bsm/db.py` to return `(c2c_items_id, created_at, updated_at)`.
+2. Switched inserted detection rule from `created_at == timestamp_now` to `created_at == updated_at` on returned rows.
+3. Removed Cloudflare-only `returning_verify_select` fallback branch; retained `fallback_select` only when `RETURNING` is unavailable.
+4. Added regression test `test_inserted_detection_mode_is_returning_for_cloudflare_path` in `src/backend/testsuite/test_db.py`.
+
+### Verification
+
+- `pytest -q src/backend/testsuite/test_db.py` → 28 passed
+
 ## 2026-03-10 D1 Batch Write Performance: SQLAlchemy Core Migration
 
 ### Planned
@@ -15,7 +33,8 @@
 4. Replaced C2C items upsert from `sa.text()` + list to `sqlite_insert(C2CItem).values(list).on_conflict_do_update()` with `.returning()` for inserted-item detection.
 5. Replaced snapshot insert from per-row `sa.text(INSERT...SELECT FROM product)` to two-step: batch `select(Product.id)` lookup + `insert(C2CItemSnapshot).values(list)`.
 6. Fixed import: `coalesce` is not a top-level SQLAlchemy export, used `func.coalesce()` instead.
-7. Bumped version to `0.9.5.6` in `package.json`, `appInfo.ts`, `main.py`.
+7. Hit D1 `too many SQL variables` error (limit: 100 params/query). Added `_D1_MAX_PARAMS = 100` chunking to split multi-row inserts (product: 12 rows/chunk, c2c: 5 rows/chunk, snapshot: 25 rows/chunk).
+8. Bumped version to `0.9.5.6` in `package.json`, `appInfo.ts`, `main.py`.
 
 ### Verification
 

@@ -94,7 +94,7 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(total_pages, 1)
         self.assertEqual(items[0]["id"], 1001)
 
-    def test_inserted_detection_remains_correct_when_cloudflare_returning_is_verified(self) -> None:
+    def test_inserted_detection_remains_correct_when_cloudflare_uses_returning_row_comparison(self) -> None:
         payload = {
             "c2cItemsId": 81101,
             "c2cItemsName": "Inserted Detection",
@@ -113,6 +113,24 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(inserted_1, 1)
         self.assertEqual(saved_2, 1)
         self.assertEqual(inserted_2, 0)
+
+    def test_inserted_detection_mode_is_returning_for_cloudflare_path(self) -> None:
+        payload = {
+            "c2cItemsId": 81102,
+            "c2cItemsName": "Inserted Detection Mode",
+            "price": 10000,
+            "showPrice": "100.00",
+            "detailDtoList": [{"itemsId": 99102, "skuId": 88102, "blindBoxId": 77102, "marketPrice": 10000}],
+        }
+        with patch("bsm.db.get_db_backend_name", return_value="cloudflare"):
+            result = db.save_items_data_phase([payload])
+
+        self.assertEqual(int(result.get("inserted") or 0), 1)
+        breakdown = result.get("data_phase_breakdown") or {}
+        self.assertEqual(
+            str(breakdown.get("c2c_inserted_detect_mode") or ""),
+            "returning",
+        )
 
     def test_save_items_normalizes_default_noface_uface(self) -> None:
         db.save_items(
