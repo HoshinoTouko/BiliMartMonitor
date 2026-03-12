@@ -113,10 +113,14 @@ async def _monitor_loop() -> None:
             await asyncio.sleep(monitor_interval)
 
             idle_seconds = cron_state.seconds_since_activity()
+            blocked_stats = cron_state.consume_blocked_stats()
+            blocked_total_seconds = float(blocked_stats.get("blocked_total_seconds", 0.0) or 0.0)
+            blocked_max_seconds = float(blocked_stats.get("blocked_max_seconds", 0.0) or 0.0)
+            blocked_count = int(blocked_stats.get("blocked_count", 0) or 0)
             uptime_seconds = max(0, int(time.monotonic() - started_at_monotonic))
             idle_text = "N/A" if idle_seconds is None else str(int(idle_seconds))
             cron_state.info(
-                f"监控心跳：uptime={uptime_seconds}s idle={idle_text}s check_interval={int(monitor_interval)}s"
+                f"监控心跳：uptime={uptime_seconds}s idle={idle_text}s check_interval={int(monitor_interval)}s blocked_total={blocked_total_seconds:.2f}s blocked_max={blocked_max_seconds:.2f}s blocked_count={blocked_count}"
             )
             if idle_seconds is None:
                 continue
@@ -166,7 +170,7 @@ async def lifespan(app: FastAPI):
     log.info("Cron, Telegram bot and monitor background tasks stopped")
 
 
-app = FastAPI(title="BiliMartMonitor API", version="0.9.5.6", lifespan=lifespan)
+app = FastAPI(title="BiliMartMonitor API", version="0.9.5.7", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # CORS — allow Next.js dev server

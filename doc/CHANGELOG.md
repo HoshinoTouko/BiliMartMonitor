@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.5.7] — 2026-03-12
+
+### Fixed
+
+- **Cron Resilience on DB Failures**: Added 3-attempt retry for scan DB write stage (`save_items_data_phase`) and changed failure handling so a failed DB write no longer terminates cron loop; it logs error and continues next category/next round.
+- **Cron State Persistence Safety**: Guarded scan-state persistence path (`cron_state.update_scan/save`) so metadata write failures are logged and ignored instead of bubbling up and killing background task.
+- **Apply Result Safety**: Wrapped `_apply_scan_result` with exception guard to ensure unexpected state-write errors do not stop scheduler progression.
+
+### Monitoring
+
+- **Blocked Time Metrics**: Added per-heartbeat blocked-time statistics (`blocked_total`, `blocked_max`, `blocked_count`) where blocked time is measured as scan round execution time exceeding configured `interval`.
+
+### Logging
+
+- **DB Breakdown Log Disabled**: Commented out `DB打点` log output in cron runner (retained in code, not deleted).
+
+### Tests
+
+- Added cron regression tests:
+  - `test_db_write_retries_three_times_then_succeeds`
+  - `test_cron_loop_records_blocked_duration_when_round_exceeds_interval`
+- Verified:
+  - `python3 -m pytest -q src/backend/testsuite/test_cron_runner.py` (13 passed)
+
 ## [0.9.5.6] — 2026-03-10
 
 ### Performance

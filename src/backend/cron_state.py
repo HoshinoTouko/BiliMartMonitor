@@ -40,6 +40,9 @@ class CronState:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     _logs: deque = field(default_factory=lambda: deque(maxlen=_MAX_LOGS), repr=False, compare=False)
     _last_activity_monotonic: float = field(default=0.0, repr=False, compare=False)
+    _blocked_total_seconds: float = field(default=0.0, repr=False, compare=False)
+    _blocked_max_seconds: float = field(default=0.0, repr=False, compare=False)
+    _blocked_count: int = field(default=0, repr=False, compare=False)
 
     # ------------------------------------------------------------------ #
     def _get_tz(self) -> "zoneinfo.ZoneInfo":
@@ -100,8 +103,12 @@ class CronState:
             self.last_activity_at = now.strftime("%Y-%m-%dT%H:%M:%S%z")
             self._last_activity_monotonic = time.monotonic()
             
-        # Save outside lock to avoid potential deadlocks if set_metadata takes time
-        self.save()
+        # Save outside lock to avoid potential deadlocks if set_metadata takes time.
+        # DB failures here should not crash cron loop.
+        try:
+            self.save()
+        except Exception as exc:
+            _CRON_LOG.warning("Failed to persist cron state metadata: %s", exc)
 
     def set_next_scan_in(self, seconds: Optional[float]) -> None:
         with self._lock:
@@ -129,6 +136,28 @@ class CronState:
         if last <= 0:
             return None
         return max(0.0, time.monotonic() - last)
+
+    def record_blocked_duration(self, seconds: float) -> None:
+        blocked = max(0.0, float(seconds or 0.0))
+        if blocked <= 0:
+            return
+        with self._lock:
+            self._blocked_total_seconds += blocked
+            self._blocked_count += 1
+            if blocked > self._blocked_max_seconds:
+                self._blocked_max_seconds = blocked
+
+    def consume_blocked_stats(self) -> dict:
+        with self._lock:
+            payload = {
+                "blocked_total_seconds": float(self._blocked_total_seconds),
+                "blocked_max_seconds": float(self._blocked_max_seconds),
+                "blocked_count": int(self._blocked_count),
+            }
+            self._blocked_total_seconds = 0.0
+            self._blocked_max_seconds = 0.0
+            self._blocked_count = 0
+        return payload
 
     def load(self) -> None:
         """Load persistent stats from database."""

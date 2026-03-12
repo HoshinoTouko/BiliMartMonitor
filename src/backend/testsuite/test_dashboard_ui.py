@@ -40,7 +40,7 @@ class DashboardUiTestCase(unittest.TestCase):
         footer = read_text("src/frontend/src/components/AppFooter.tsx")
         info = read_text("src/frontend/src/lib/appInfo.ts")
 
-        self.assertIn('export const APP_VERSION = "0.9.5.1"', info)
+        self.assertIn('export const APP_VERSION = "0.9.5.7"', info)
         self.assertIn('export const APP_COPYRIGHT = "© Touko Hoshino"', info)
         self.assertIn("v{APP_VERSION} | {APP_COPYRIGHT}", footer)
 

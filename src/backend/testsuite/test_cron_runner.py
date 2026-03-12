@@ -513,6 +513,80 @@ class CronRunnerTestCase(unittest.TestCase):
         self.assertEqual(mock_apply_scan_results.call_count, 1)
         self.assertEqual(mock_refresh_session_cache.call_count, 1)
 
+    @patch("bsm.notify.load_notifier")
+    @patch("bsm.scan.scan_once_async", new_callable=AsyncMock)
+    @patch("bsm.db.apply_bili_session_scan_results")
+    @patch("bsm.db.save_items_data_phase")
+    @patch("bsm.db.list_bili_sessions")
+    @patch("bsm.settings.load_runtime_config")
+    def test_db_write_retries_three_times_then_succeeds(
+        self,
+        mock_load_runtime_config: MagicMock,
+        mock_list_bili_sessions: MagicMock,
+        mock_save_items_data_phase: MagicMock,
+        mock_apply_scan_results: MagicMock,
+        mock_scan_once: MagicMock,
+        mock_load_notifier: MagicMock,
+    ) -> None:
+        mock_load_runtime_config.return_value = {
+            "interval": 60,
+            "scan_mode": "continue",
+            "category": "2312",
+            "sort_type": "TIME_DESC",
+            "notify": {},
+        }
+        mock_list_bili_sessions.return_value = [{
+            "cookies": "cookie",
+            "login_username": "tester",
+            "status": "active",
+            "last_error": None,
+            "last_checked_at": None,
+        }]
+        items = [{"c2cItemsId": 1}]
+        mock_scan_once.return_value = ("cursor-1", items)
+        mock_save_items_data_phase.side_effect = [
+            Exception("db temporary fail 1"),
+            Exception("db temporary fail 2"),
+            {
+                "saved": 1,
+                "inserted": 1,
+                "data_write_ms": 1,
+                "blob_write_ms": 0,
+                "blob_write_count": 1,
+                "new_items": items,
+            },
+        ]
+        notifier = MagicMock()
+        mock_load_notifier.return_value = notifier
+
+        with patch("backend.cron_runner._DB_WRITE_RETRY_BASE_SECONDS", 0):
+            result = asyncio.run(cron_runner._run_scan_once())
+
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(mock_save_items_data_phase.call_count, 3)
+        self.assertEqual(mock_apply_scan_results.call_count, 1)
+
+    def test_cron_loop_records_blocked_duration_when_round_exceeds_interval(self) -> None:
+        async def _fake_run_scan_once(*, defer_db_finalize: bool = False) -> dict[str, object]:
+            self.assertFalse(defer_db_finalize)
+            if not hasattr(_fake_run_scan_once, "_called"):
+                setattr(_fake_run_scan_once, "_called", True)
+                await asyncio.sleep(0.12)
+                return {
+                    "skip": True,
+                    "interval": 0.05,
+                    "admin_scan_summary_interval_seconds": 600,
+                }
+            raise asyncio.CancelledError()
+
+        with patch("backend.cron_runner._run_scan_once", new=AsyncMock(side_effect=_fake_run_scan_once)), \
+             patch("backend.cron_runner.cron_state.record_blocked_duration") as mock_record:
+            asyncio.run(cron_runner.cron_loop())
+
+        self.assertGreaterEqual(mock_record.call_count, 1)
+        blocked_value = float(mock_record.call_args_list[0].args[0])
+        self.assertGreater(blocked_value, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

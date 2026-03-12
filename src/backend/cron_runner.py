@@ -41,6 +41,8 @@ _BLOB_WRITE_TASKS: set[asyncio.Task[None]] = set()
 _BLOB_WRITE_SEMAPHORE: asyncio.Semaphore | None = None
 _BLOB_WRITE_MAX_CONCURRENCY = 10
 _BLOB_ALERT_THRESHOLD = 8
+_DB_WRITE_MAX_ATTEMPTS = 3
+_DB_WRITE_RETRY_BASE_SECONDS = 0.5
 _BLOB_ALERT_ACTIVE = False
 _BLOB_RUNNING_COUNT = 0
 _SCAN_PROGRESS_LOADED = False
@@ -560,6 +562,7 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
             category = job.get("category")
             page = int(job.get("page") or 0)
             items = list(job.get("items") or [])
+            trace_id = str(job.get("trace_id") or "-")
             if not items:
                 return (category, page), {
                     "new_items": [],
@@ -572,22 +575,45 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
                     "blob_is_cloudflare": False,
                 }
 
-            def _run_db_pipeline() -> dict[str, object]:
-                save_result = save_items_data_phase(items)
-                return {
-                    "new_items": list(save_result.get("new_items") or []),
-                    "saved": int(save_result.get("saved") or 0),
-                    "inserted": int(save_result.get("inserted") or 0),
-                    "db_duration_ms": int(save_result.get("data_write_ms") or 0),
-                    "db_breakdown": dict(save_result.get("data_phase_breakdown") or {}),
-                    "blob_write_count": int(save_result.get("blob_write_count") or 0),
-                    "pending_blob_updates": list(save_result.get("pending_blob_updates") or []),
-                    "blob_backend_name": str(save_result.get("backend_name") or ""),
-                    "blob_is_cloudflare": bool(save_result.get("is_cloudflare") is True),
-                }
+            last_error: Exception | None = None
+            for attempt in range(1, _DB_WRITE_MAX_ATTEMPTS + 1):
+                try:
+                    def _run_db_pipeline() -> dict[str, object]:
+                        save_result = save_items_data_phase(items)
+                        return {
+                            "new_items": list(save_result.get("new_items") or []),
+                            "saved": int(save_result.get("saved") or 0),
+                            "inserted": int(save_result.get("inserted") or 0),
+                            "db_duration_ms": int(save_result.get("data_write_ms") or 0),
+                            "db_breakdown": dict(save_result.get("data_phase_breakdown") or {}),
+                            "blob_write_count": int(save_result.get("blob_write_count") or 0),
+                            "pending_blob_updates": list(save_result.get("pending_blob_updates") or []),
+                            "blob_backend_name": str(save_result.get("backend_name") or ""),
+                            "blob_is_cloudflare": bool(save_result.get("is_cloudflare") is True),
+                        }
 
-            result = await asyncio.to_thread(_run_db_pipeline)
-            return (category, page), result
+                    result = await asyncio.to_thread(_run_db_pipeline)
+                    return (category, page), result
+                except Exception as exc:
+                    last_error = exc
+                    _log_exec(
+                        f"DB写入失败 | 分类 {_category_label(category)} | 第 {page} 页 | 尝试 {attempt}/{_DB_WRITE_MAX_ATTEMPTS} | {exc} | 追踪ID {trace_id}",
+                        level="warn" if attempt < _DB_WRITE_MAX_ATTEMPTS else "error",
+                    )
+                    if attempt < _DB_WRITE_MAX_ATTEMPTS:
+                        await asyncio.sleep(_DB_WRITE_RETRY_BASE_SECONDS * attempt)
+
+            return (category, page), {
+                "new_items": [],
+                "saved": 0,
+                "inserted": 0,
+                "db_duration_ms": 0,
+                "blob_write_count": 0,
+                "pending_blob_updates": [],
+                "blob_backend_name": "",
+                "blob_is_cloudflare": False,
+                "db_error": str(last_error) if last_error else "DB写入失败",
+            }
 
         for job in category_jobs:
             if str(job.get("error") or "").strip():
@@ -635,6 +661,22 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
             items = list(job.get("items") or [])
             next_id = job.get("next_id")
             db_result = db_results.get((category, page)) or {}
+            db_error = str(db_result.get("db_error") or "").strip()
+            if db_error:
+                error = db_error
+            if error:
+                any_error = any_error or error
+                session_errors[username] = error
+                _log_exec(
+                    f"扫描出错 | 账号 {username or '未知'} | 分类 {_category_label(category)} | 耗时 {duration_ms} ms | {error} | 追踪ID {trace_id}",
+                    level="error",
+                )
+                await asyncio.to_thread(
+                    send_admin_telegram_alert,
+                    f"系统告警\n类型: 扫描异常\n账号: {username or '未知'}\n分类: {_category_label(category)}\n追踪ID: {trace_id}\n详情: {error}",
+                    cfg,
+                )
+                continue
             new_items = list(db_result.get("new_items") or [])
             saved = int(db_result.get("saved") or 0)
             inserted = int(db_result.get("inserted") or 0)
@@ -744,16 +786,16 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
             _log_exec(
                 f"扫描完成 | 分类 {_category_label(category)} | 模式 {mode_label} | 第 {page} 页 | {len(items)} 条 | 新增 {inserted} 条 | 耗时 API {duration_ms} ms | DB {db_duration_ms} ms | 追踪ID {trace_id}"
             )
-            if db_breakdown:
-                prepare_ms = int(db_breakdown.get("prepare_payload_ms") or 0)
-                product_ms = int(db_breakdown.get("product_upsert_ms") or 0)
-                c2c_upsert_ms = int(db_breakdown.get("c2c_upsert_ms") or 0)
-                inserted_detect_ms = int(db_breakdown.get("c2c_inserted_detect_ms") or 0)
-                snapshot_ms = int(db_breakdown.get("snapshot_insert_ms") or 0)
-                detect_mode = str(db_breakdown.get("c2c_inserted_detect_mode") or "none")
-                _log_exec(
-                    f"DB打点 | 分类 {_category_label(category)} | 第 {page} 页 | prepare {prepare_ms} ms | product_upsert {product_ms} ms | c2c_upsert {c2c_upsert_ms} ms | inserted_detect[{detect_mode}] {inserted_detect_ms} ms | snapshot_insert {snapshot_ms} ms | 总计 {db_duration_ms} ms | 追踪ID {trace_id}"
-                )
+            # if db_breakdown:
+            #     prepare_ms = int(db_breakdown.get("prepare_payload_ms") or 0)
+            #     product_ms = int(db_breakdown.get("product_upsert_ms") or 0)
+            #     c2c_upsert_ms = int(db_breakdown.get("c2c_upsert_ms") or 0)
+            #     inserted_detect_ms = int(db_breakdown.get("c2c_inserted_detect_ms") or 0)
+            #     snapshot_ms = int(db_breakdown.get("snapshot_insert_ms") or 0)
+            #     detect_mode = str(db_breakdown.get("c2c_inserted_detect_mode") or "none")
+            #     _log_exec(
+            #         f"DB打点 | 分类 {_category_label(category)} | 第 {page} 页 | prepare {prepare_ms} ms | product_upsert {product_ms} ms | c2c_upsert {c2c_upsert_ms} ms | inserted_detect[{detect_mode}] {inserted_detect_ms} ms | snapshot_insert {snapshot_ms} ms | 总计 {db_duration_ms} ms | 追踪ID {trace_id}"
+            #     )
             _log_wait(f"下次扫描 | 分类 {_category_label(category)} | 第 {_mode_page(mode, category)} 页 | 追踪ID {trace_id}")
             if username and username not in session_errors:
                 session_success_count[username] = session_success_count.get(username, 0) + len(items)
@@ -868,19 +910,22 @@ def _apply_scan_result(
     result: dict[str, object],
     bucket: dict[str, dict[str, int | str]],
 ) -> None:
-    if result.get("skip") or result.get("deferred"):
-        return
-    cron_state.update_scan(
-        count=result.get("count", 0),
-        saved=result.get("saved", 0),
-        inserted=result.get("inserted", 0),
-        error=result.get("error"),
-    )
-    summary_rows = result.get("summary_rows") or []
-    if isinstance(summary_rows, list):
-        for row in summary_rows:
-            if isinstance(row, dict):
-                _accumulate_admin_scan_summary(bucket, row)
+    try:
+        if result.get("skip") or result.get("deferred"):
+            return
+        cron_state.update_scan(
+            count=result.get("count", 0),
+            saved=result.get("saved", 0),
+            inserted=result.get("inserted", 0),
+            error=result.get("error"),
+        )
+        summary_rows = result.get("summary_rows") or []
+        if isinstance(summary_rows, list):
+            for row in summary_rows:
+                if isinstance(row, dict):
+                    _accumulate_admin_scan_summary(bucket, row)
+    except Exception as exc:
+        _log_exec(f"写入扫描状态失败（已忽略，继续下一轮）: {exc}", level="error")
 
 
 async def cron_loop() -> None:
@@ -917,6 +962,12 @@ async def cron_loop() -> None:
             result = {"skip": False, "count": 0, "saved": 0,
                       "inserted": 0, "error": str(e), "interval": 20, "admin_scan_summary_interval_seconds": int(admin_summary_interval_seconds)}
         _apply_scan_result(result, admin_summary_bucket)
+        post_round_now = _CRON_LOOP.time()
+        interval = float(result.get("interval", 20) or 20)
+        blocked_seconds = max(0.0, post_round_now - (dispatch_started_at + interval))
+        if blocked_seconds > 0:
+            cron_state.record_blocked_duration(blocked_seconds)
+            _log_wait(f"检测到调度阻塞 {blocked_seconds:.2f} 秒（执行耗时超过间隔 {int(interval)} 秒）", level="warn")
 
         now = _CRON_LOOP.time()
         configured_admin_interval = float(result.get("admin_scan_summary_interval_seconds", admin_summary_interval_seconds) or admin_summary_interval_seconds)
@@ -937,7 +988,6 @@ async def cron_loop() -> None:
             while next_admin_summary_at <= now:
                 next_admin_summary_at += admin_summary_interval_seconds
 
-        interval = float(result.get("interval", 20) or 20)
         _log_wait(f"等待 {int(interval)} 秒")
 
         try:
