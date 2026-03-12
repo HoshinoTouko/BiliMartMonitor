@@ -1,5 +1,25 @@
 # Work Log
 
+## 2026-03-12 D1 Param Limit Regression: Product Lookup Chunking
+
+### Planned
+
+- Fix `too many SQL variables` failure reported in scan data-phase for product triple lookup.
+- Add deterministic regression coverage that enforces D1-like 100 bind-parameter cap during tests.
+
+### Step Log
+
+1. Located failure in `save_items_data_phase` (`src/bsm/db.py`): `(blindbox_id, items_id, sku_id) IN (...)` lookup was not chunked.
+2. Applied chunked product-id resolve query with `_product_lookup_chunk = max(1, _D1_MAX_PARAMS // 3)`.
+3. Hardened fallback inserted-id verify query by chunking `c2c_items_id IN (...)` with `_id_lookup_chunk = max(1, _D1_MAX_PARAMS)`.
+4. Added DB regression test `test_save_items_data_phase_chunks_lookup_queries_under_d1_param_limit` in `src/backend/testsuite/test_db.py`.
+5. Added incident note doc: `doc/D1_PARAM_LIMIT_INCIDENT_2026-03-12.md`.
+
+### Verification
+
+- `pytest -q src/backend/testsuite/test_db.py` → passed
+- `pytest -q src/backend/testsuite/test_perf_optimizations.py src/backend/testsuite/test_refresh_api.py` → passed
+
 ## 2026-03-11 Cloudflare Inserted Detection: Returning Row Comparison
 
 ### Planned

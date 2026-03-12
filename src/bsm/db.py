@@ -1854,15 +1854,20 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             c2c_upsert_ms = int((time.perf_counter() - c2c_upsert_started_at) * 1000)
             inserted_detect_started_at = time.perf_counter()
             if not used_returning:
-                verified_inserted_ids = set(
-                    int(row[0])
-                    for row in session.execute(
-                        select(C2CItem.c2c_items_id).where(
-                            C2CItem.c2c_items_id.in_([int(it["c2c_items_id"]) for it in c2c_upsert_payload]),
-                            C2CItem.created_at == timestamp_now,
-                        )
-                    ).all()
-                )
+                upsert_item_ids = [int(it["c2c_items_id"]) for it in c2c_upsert_payload]
+                _id_lookup_chunk = max(1, _D1_MAX_PARAMS)
+                verified_inserted_ids: set[int] = set()
+                for i in range(0, len(upsert_item_ids), _id_lookup_chunk):
+                    chunk_ids = upsert_item_ids[i : i + _id_lookup_chunk]
+                    verified_inserted_ids.update(
+                        int(row[0])
+                        for row in session.execute(
+                            select(C2CItem.c2c_items_id).where(
+                                C2CItem.c2c_items_id.in_(chunk_ids),
+                                C2CItem.created_at == timestamp_now,
+                            )
+                        ).all()
+                    )
                 inserted_ids = verified_inserted_ids
                 c2c_inserted_detect_mode = "fallback_select"
             c2c_inserted_detect_ms = int((time.perf_counter() - inserted_detect_started_at) * 1000)
@@ -1886,17 +1891,21 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                 product_keys_needed.add((int(blindbox_id), int(items_id), int(sku_id)))
             product_id_map: Dict[Tuple[int, int, int], int] = {}
             if product_keys_needed:
-                product_id_rows = session.execute(
-                    select(
-                        Product.id, Product.blindbox_id, Product.items_id, Product.sku_id
-                    ).where(
-                        tuple_(
-                            Product.blindbox_id, Product.items_id, Product.sku_id
-                        ).in_(list(product_keys_needed))
-                    )
-                ).all()
-                for pid, bid, iid, sid in product_id_rows:
-                    product_id_map[(int(bid), int(iid), int(sid))] = int(pid)
+                product_keys = list(product_keys_needed)
+                _product_lookup_chunk = max(1, _D1_MAX_PARAMS // 3)
+                for i in range(0, len(product_keys), _product_lookup_chunk):
+                    key_chunk = product_keys[i : i + _product_lookup_chunk]
+                    product_id_rows = session.execute(
+                        select(
+                            Product.id, Product.blindbox_id, Product.items_id, Product.sku_id
+                        ).where(
+                            tuple_(
+                                Product.blindbox_id, Product.items_id, Product.sku_id
+                            ).in_(key_chunk)
+                        )
+                    ).all()
+                    for pid, bid, iid, sid in product_id_rows:
+                        product_id_map[(int(bid), int(iid), int(sid))] = int(pid)
             # Step 2: build snapshot rows with resolved product_id
             snapshot_rows: List[Dict[str, Any]] = []
             for item_id, snapshot_at, blindbox_id, items_id, sku_id, est_price in snapshot_candidates:

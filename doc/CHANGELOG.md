@@ -7,6 +7,7 @@
 - **Cron Resilience on DB Failures**: Added 3-attempt retry for scan DB write stage (`save_items_data_phase`) and changed failure handling so a failed DB write no longer terminates cron loop; it logs error and continues next category/next round.
 - **Cron State Persistence Safety**: Guarded scan-state persistence path (`cron_state.update_scan/save`) so metadata write failures are logged and ignored instead of bubbling up and killing background task.
 - **Apply Result Safety**: Wrapped `_apply_scan_result` with exception guard to ensure unexpected state-write errors do not stop scheduler progression.
+- **D1 Product Lookup Param Limit**: Fixed snapshot write path in `save_items_data_phase` by chunking `(blindbox_id, items_id, sku_id)` tuple lookup (`Product` id resolve) to stay under Cloudflare D1's 100 bind-parameter limit per statement. Also chunked fallback inserted-id verify query (`c2c_items_id IN (...)`) to avoid future oversized `IN` lists.
 
 ### Monitoring
 
@@ -21,6 +22,8 @@
 - Added cron regression tests:
   - `test_db_write_retries_three_times_then_succeeds`
   - `test_cron_loop_records_blocked_duration_when_round_exceeds_interval`
+- Added DB regression test:
+  - `test_save_items_data_phase_chunks_lookup_queries_under_d1_param_limit`
 - Verified:
   - `python3 -m pytest -q src/backend/testsuite/test_cron_runner.py` (13 passed)
 

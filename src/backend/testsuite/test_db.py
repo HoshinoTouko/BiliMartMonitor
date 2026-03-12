@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import update
+from sqlalchemy import event, update
 from unittest.mock import patch
 
 
@@ -131,6 +131,68 @@ class DatabaseTestCase(unittest.TestCase):
             str(breakdown.get("c2c_inserted_detect_mode") or ""),
             "returning",
         )
+
+    def test_save_items_data_phase_chunks_lookup_queries_under_d1_param_limit(self) -> None:
+        payload = {
+            "c2cItemsId": 81103,
+            "c2cItemsName": "Chunked Product Lookup",
+            "price": 35000,
+            "showPrice": "350.00",
+            "detailDtoList": [
+                {
+                    "itemsId": 9910300 + i,
+                    "skuId": 8810300 + i,
+                    "blindBoxId": 7710300 + i,
+                    "name": f"Product-{i}",
+                    "marketPrice": 1000 + i,
+                }
+                for i in range(35)
+            ],
+        }
+
+        backend = db._require_sqlalchemy_backend()
+
+        def _count_params(parameters) -> int:
+            if parameters is None:
+                return 0
+            if isinstance(parameters, dict):
+                return len(parameters)
+            if isinstance(parameters, (list, tuple)):
+                if not parameters:
+                    return 0
+                first = parameters[0]
+                if isinstance(first, dict):
+                    return len(first)
+                if isinstance(first, (list, tuple)):
+                    return len(first)
+                return len(parameters)
+            return 0
+
+        def _enforce_d1_limit(conn, cursor, statement, parameters, context, executemany) -> None:
+            param_count = _count_params(parameters[0] if executemany else parameters)
+            if param_count > db._D1_MAX_PARAMS:
+                raise AssertionError(
+                    f"Bind params exceed D1 limit: {param_count} > {db._D1_MAX_PARAMS}"
+                )
+
+        event.listen(backend._engine, "before_cursor_execute", _enforce_d1_limit)
+        try:
+            result = db.save_items_data_phase([payload])
+        finally:
+            event.remove(backend._engine, "before_cursor_execute", _enforce_d1_limit)
+
+        self.assertEqual(int(result.get("saved") or 0), 1)
+        self.assertEqual(int(result.get("inserted") or 0), 1)
+
+        with backend.session() as session:
+            product_count = session.query(Product).count()
+            snapshot_count = (
+                session.query(C2CItemSnapshot)
+                .filter(C2CItemSnapshot.c2c_items_id == 81103)
+                .count()
+            )
+        self.assertEqual(product_count, 35)
+        self.assertEqual(snapshot_count, 35)
 
     def test_save_items_normalizes_default_noface_uface(self) -> None:
         db.save_items(
