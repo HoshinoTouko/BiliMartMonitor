@@ -11,7 +11,7 @@ interface DashboardStats {
     today_new_item_count: number;
     user_count: number;
     active_session_count: number;
-    item_count: number;
+    item_count: number | null;
     last_scan_at: string | null;
     is_running: boolean;
 }

@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import event, update
@@ -94,6 +95,37 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(total_pages, 1)
         self.assertEqual(items[0]["id"], 1001)
 
+    def test_market_list_query_omits_detail_blob(self) -> None:
+        db.save_items(
+            [
+                {
+                    "c2cItemsId": 81100,
+                    "c2cItemsName": "Narrow Market Row",
+                    "price": 10000,
+                    "showPrice": "100.00",
+                    "detailDtoList": [{"itemsId": 91100, "skuId": 92100, "blindBoxId": 93100, "marketPrice": 10000}],
+                }
+            ]
+        )
+        backend = db._require_sqlalchemy_backend()
+        statements: list[str] = []
+
+        def _capture_select(conn, cursor, statement, parameters, context, executemany) -> None:
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(backend._engine, "before_cursor_execute", _capture_select)
+        try:
+            with patch("bsm.db.get_db_backend_name", return_value="cloudflare"):
+                items, _, _ = db.list_market_items(page=1, limit=20, sort_by="TIME_DESC", time_filter_hours=0)
+        finally:
+            event.remove(backend._engine, "before_cursor_execute", _capture_select)
+
+        self.assertEqual(items[0]["id"], 81100)
+        c2c_selects = [stmt for stmt in statements if "FROM c2c_items " in stmt and "ORDER BY" in stmt]
+        self.assertTrue(c2c_selects)
+        self.assertFalse(any("detail_blob" in stmt.lower() for stmt in c2c_selects))
+
     def test_inserted_detection_remains_correct_when_cloudflare_uses_returning_row_comparison(self) -> None:
         payload = {
             "c2cItemsId": 81101,
@@ -114,7 +146,7 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(saved_2, 1)
         self.assertEqual(inserted_2, 0)
 
-    def test_inserted_detection_mode_is_returning_for_cloudflare_path(self) -> None:
+    def test_inserted_detection_mode_is_prefetch_for_cloudflare_path(self) -> None:
         payload = {
             "c2cItemsId": 81102,
             "c2cItemsName": "Inserted Detection Mode",
@@ -129,7 +161,7 @@ class DatabaseTestCase(unittest.TestCase):
         breakdown = result.get("data_phase_breakdown") or {}
         self.assertEqual(
             str(breakdown.get("c2c_inserted_detect_mode") or ""),
-            "returning",
+            "prefetch",
         )
 
     def test_save_items_data_phase_chunks_lookup_queries_under_d1_param_limit(self) -> None:
@@ -672,6 +704,26 @@ class DatabaseTestCase(unittest.TestCase):
         sessions = db.list_bili_sessions(status=None)
         self.assertEqual(sessions, [])
 
+    def test_list_bili_sessions_can_omit_cookies_column(self) -> None:
+        db.save_bili_session("cookie-a", login_username="bili-a")
+        backend = db._require_sqlalchemy_backend()
+        statements: list[str] = []
+
+        def _capture_select(conn, cursor, statement, parameters, context, executemany) -> None:
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(backend._engine, "before_cursor_execute", _capture_select)
+        try:
+            sessions = db.list_bili_sessions(status=None, include_cookies=False)
+        finally:
+            event.remove(backend._engine, "before_cursor_execute", _capture_select)
+
+        self.assertEqual(sessions[0]["cookies"], "")
+        session_selects = [stmt for stmt in statements if "FROM bili_sessions" in stmt]
+        self.assertTrue(session_selects)
+        self.assertFalse(any("cookies" in stmt.lower() for stmt in session_selects))
+
     def test_bili_session_created_by_requires_existing_access_user(self) -> None:
         with self.assertRaises(Exception):
             db.save_bili_session("cookie-a", login_username="bili-a", created_by="missing-user")
@@ -770,16 +822,18 @@ class DatabaseTestCase(unittest.TestCase):
         )
 
         backend = db._require_sqlalchemy_backend()
+        recent_at = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old_at = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         with backend.session() as session:
             session.execute(
                 update(C2CItem)
                 .where(C2CItem.c2c_items_id == 9101)
-                .values(updated_at="2026-03-06T00:00:00Z", created_at="2026-03-06T00:00:00Z")
+                .values(updated_at=recent_at, created_at=recent_at)
             )
             session.execute(
                 update(C2CItem)
                 .where(C2CItem.c2c_items_id == 9102)
-                .values(updated_at="2025-01-01T00:00:00Z", created_at="2025-01-01T00:00:00Z")
+                .values(updated_at=old_at, created_at=old_at)
             )
             session.commit()
 
@@ -839,10 +893,18 @@ class AlembicMigrationTestCase(unittest.TestCase):
             self.assertIn("telegram_ids_json", access_columns)
             self.assertIn("password_hash", access_columns)
             self.assertNotIn("telegram_id", access_columns)
+
+            c2c_indexes = {row[1] for row in conn.execute("PRAGMA index_list(c2c_items)").fetchall()}
+            self.assertIn("idx_c2c_items_created_updated_id", c2c_indexes)
+            self.assertIn("idx_c2c_items_category_created_updated_id", c2c_indexes)
+            self.assertNotIn("idx_c2c_items_updated_at", c2c_indexes)
+
+            access_indexes = {row[1] for row in conn.execute("PRAGMA index_list(access_users)").fetchall()}
+            self.assertIn("idx_access_users_status_created_id_username", access_indexes)
         finally:
             conn.close()
 
-    def test_alembic_upgrade_records_single_init_revision(self) -> None:
+    def test_alembic_upgrade_records_current_head_revision(self) -> None:
         os.environ["BSM_DB_BACKEND"] = "sqlite"
         os.environ["BSM_SQLITE_PATH"] = self.db_path
         with open(self.env_path, "w", encoding="utf-8") as f:
@@ -856,7 +918,7 @@ class AlembicMigrationTestCase(unittest.TestCase):
         try:
             row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
             self.assertIsNotNone(row)
-            self.assertEqual(row[0], "0001_init")
+            self.assertEqual(row[0], "0002_d1_performance_indexes")
         finally:
             conn.close()
 

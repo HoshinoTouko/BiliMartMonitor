@@ -80,14 +80,15 @@ async def api_get_account_dashboard(_: Dict[str, Any] = Depends(get_current_user
     from bsm.settings import list_access_users
 
     cron = cron_state.to_dict()
+    item_count = count_items()
     return JSONResponse(
         {
             "ok": True,
             "today_refresh_count": int(cron.get("today_scans") or 0),
             "today_new_item_count": int(cron.get("today_inserted") or 0),
             "user_count": len(list_access_users(status="active")),
-            "active_session_count": len(list_bili_sessions(status="active")),
-            "item_count": count_items(),
+            "active_session_count": len(list_bili_sessions(status="active", include_cookies=False)),
+            "item_count": item_count,
             "last_scan_at": cron.get("last_scan_at"),
             "is_running": bool(cron.get("is_running")),
         }

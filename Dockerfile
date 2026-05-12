@@ -1,11 +1,18 @@
 # syntax=docker/dockerfile:1
 
 # Stage 1: Build the Next.js frontend (Standalone)
-FROM node:20-alpine AS frontend-builder
+FROM node:22-alpine AS frontend-builder
 WORKDIR /app/src/frontend
-RUN corepack enable pnpm
+# Install and configure pnpm via domestic mirror
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm install -g pnpm \
+    && pnpm config set registry https://registry.npmmirror.com \
+    && pnpm config set fetch-retries 5 \
+    && pnpm config set fetch-retry-factor 2 \
+    && pnpm config set fetch-retry-mintimeout 10000 \
+    && pnpm config set fetch-retry-maxtimeout 120000
 COPY src/frontend/package.json src/frontend/pnpm-lock.yaml* src/frontend/pnpm-workspace.yaml* ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --ignore-scripts
 COPY src/frontend/ ./
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN pnpm build
@@ -14,11 +21,15 @@ RUN pnpm build
 FROM python:3.11-slim AS runner
 
 # Install Node.js runtime and essential build tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true \
+    && sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true \
+    && sed -i 's/security.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true \
+    && sed -i 's/security.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true \
+    && apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gcc \
     libsqlite3-dev \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 

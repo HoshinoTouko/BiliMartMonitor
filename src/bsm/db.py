@@ -3,7 +3,6 @@ import base64
 import json
 import logging
 import os
-import re
 import threading
 import time
 import urllib.parse
@@ -19,7 +18,7 @@ from sqlalchemy import and_, case, create_engine, delete, event, func, insert, l
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, aliased, sessionmaker
+from sqlalchemy.orm import Session, aliased, load_only, sessionmaker
 from .env import data_dir, env_int, env_str, load_dotenv, resolve_project_path
 from .passwords import hash_password, is_password_hash
 from .orm_models import (
@@ -37,6 +36,11 @@ _BACKEND_INSTANCE: Optional["SqlalchemyBackend"] = None
 
 # Cloudflare D1 limits bind parameters to 100 per query.
 _D1_MAX_PARAMS = 100
+_D1_PRODUCT_UPSERT_ROWS = 4
+_D1_C2C_UPSERT_ROWS = 3
+_D1_ID_LOOKUP_ROWS = 25
+_D1_PRODUCT_LOOKUP_ROWS = 10
+_D1_SNAPSHOT_INSERT_ROWS = 10
 _BACKEND_CACHE_KEY: Tuple[str, str] = ("", "")
 _DB_REQUEST_TRACE: ContextVar[Optional[Dict[str, float]]] = ContextVar(
     "bsm_db_request_trace",
@@ -174,6 +178,10 @@ def _load_db_settings() -> Dict[str, Any]:
 
 def get_db_backend_name() -> str:
     return str(_load_db_settings().get("backend", "sqlite"))
+
+
+def _is_cloudflare_backend() -> bool:
+    return get_db_backend_name() == "cloudflare"
 
 
 @dataclass
@@ -382,11 +390,11 @@ def _require_sqlalchemy_backend() -> "SqlalchemyBackend":
     return backend
 
 
-def _bili_session_to_dict(row: BiliSession) -> Dict[str, Any]:
+def _bili_session_to_dict(row: BiliSession, *, include_cookies: bool = True) -> Dict[str, Any]:
     return {
         "id": row.id,
         "login_username": row.login_username,
-        "cookies": row.cookies,
+        "cookies": row.cookies if include_cookies else "",
         "created_by": row.created_by,
         "status": row.status,
         "fetch_count": int(row.fetch_count or 0),
@@ -627,24 +635,57 @@ def _market_item_to_dict(
     }
 
 
+def _market_item_list_load_only():
+    return load_only(
+        C2CItem.c2c_items_id,
+        C2CItem.category_id,
+        C2CItem.c2c_items_name,
+        C2CItem.show_price,
+        C2CItem.show_market_price,
+        C2CItem.uface,
+        C2CItem.uname,
+        C2CItem.created_at,
+        C2CItem.updated_at,
+        C2CItem.publish_status,
+        C2CItem.sale_status,
+        C2CItem.drop_reason,
+    )
+
+
 def _load_current_details_for_c2c_ids(c2c_items_ids: Sequence[int]) -> Dict[int, List[Dict[str, Any]]]:
     if not c2c_items_ids:
         return {}
     backend = _require_sqlalchemy_backend()
-    current_details = _current_item_details_subquery("market_item_details_for_ids")
+    item_ids = sorted({int(item) for item in c2c_items_ids})
+    latest_snapshot = (
+        select(
+            C2CItemSnapshot.c2c_items_id.label("c2c_items_id"),
+            func.max(C2CItemSnapshot.snapshot_at).label("snapshot_at"),
+        )
+        .where(C2CItemSnapshot.c2c_items_id.in_(item_ids))
+        .group_by(C2CItemSnapshot.c2c_items_id)
+        .subquery("market_item_details_for_ids_latest")
+    )
     with backend.session() as session:
         rows = session.execute(
             select(
-                current_details.c.c2c_items_id,
-                current_details.c.items_id,
-                current_details.c.sku_id,
-                current_details.c.name,
-                current_details.c.img_url,
-                current_details.c.market_price,
-                current_details.c.id,
+                C2CItemSnapshot.c2c_items_id,
+                Product.items_id,
+                Product.sku_id,
+                Product.name,
+                Product.img_url,
+                Product.market_price,
+                C2CItemSnapshot.id,
             )
-            .where(current_details.c.c2c_items_id.in_(list(c2c_items_ids)))
-            .order_by(current_details.c.c2c_items_id.asc(), current_details.c.id.asc())
+            .join(Product, Product.id == C2CItemSnapshot.product_id)
+            .join(
+                latest_snapshot,
+                and_(
+                    C2CItemSnapshot.c2c_items_id == latest_snapshot.c.c2c_items_id,
+                    C2CItemSnapshot.snapshot_at == latest_snapshot.c.snapshot_at,
+                ),
+            )
+            .order_by(C2CItemSnapshot.c2c_items_id.asc(), C2CItemSnapshot.id.asc())
         ).all()
 
     result: Dict[int, List[Dict[str, Any]]] = {}
@@ -736,21 +777,20 @@ def _market_recent_listing_count_expr(cutoff: Optional[str] = None):
 
 
 def _market_page_order_clauses(sort_by: str):
-    created_or_updated = func.coalesce(C2CItem.created_at, C2CItem.updated_at)
     if sort_by == "TIME_DESC":
-        return (created_or_updated.desc(), C2CItem.c2c_items_id.desc())
+        return (C2CItem.created_at.desc(), C2CItem.updated_at.desc(), C2CItem.c2c_items_id.desc())
     if sort_by == "TIME_ASC":
-        return (created_or_updated.asc(), C2CItem.c2c_items_id.asc())
+        return (C2CItem.created_at.asc(), C2CItem.updated_at.asc(), C2CItem.c2c_items_id.asc())
     if sort_by == "ID_ASC":
         return (C2CItem.c2c_items_id.asc(),)
     if sort_by == "ID_DESC":
         return (C2CItem.c2c_items_id.desc(),)
     if sort_by == "PRICE_ASC":
-        return (C2CItem.price.asc(), created_or_updated.desc())
+        return (C2CItem.price.asc(), C2CItem.created_at.desc(), C2CItem.c2c_items_id.desc())
     if sort_by == "PRICE_DESC":
-        return (C2CItem.price.desc(), created_or_updated.desc())
+        return (C2CItem.price.desc(), C2CItem.created_at.desc(), C2CItem.c2c_items_id.desc())
     # Default market ordering follows creation timestamp (created_at) descending.
-    return (created_or_updated.desc(), C2CItem.c2c_items_id.desc())
+    return (C2CItem.created_at.desc(), C2CItem.updated_at.desc(), C2CItem.c2c_items_id.desc())
 
 
 def _recent_listing_page_order_clauses(numbered_rows, sort_by: str):
@@ -784,66 +824,58 @@ def _load_market_items_page(
     page = max(1, page)
     offset = (page - 1) * limit
     order_clauses = _market_page_order_clauses(sort_by)
+    is_cloudflare = _is_cloudflare_backend()
 
-    base_stmt = select(
-        C2CItem.c2c_items_id.label("c2c_items_id"),
-        func.row_number().over(order_by=order_clauses).label("row_num"),
-        func.count().over().label("total_count"),
-    )
+    filters = []
 
     if keyword is not None:
-        base_stmt = base_stmt.where(C2CItem.c2c_items_name.like(f"%{keyword}%"))
+        filters.append(C2CItem.c2c_items_name.like(f"%{keyword}%"))
 
     normalized_category_ids = [str(item).strip() for item in (category_ids or []) if str(item).strip()]
     if normalized_category_ids:
-        base_stmt = base_stmt.where(C2CItem.category_id.in_(normalized_category_ids))
+        filters.append(C2CItem.category_id.in_(normalized_category_ids))
 
     if time_filter_hours > 0:
         cutoff = _utc_cutoff(hours=time_filter_hours)
-        base_stmt = base_stmt.where(C2CItem.updated_at >= cutoff)
-
-    filtered_cte = base_stmt.cte("filtered_market_items")
-    totals_cte = (
-        select(func.max(filtered_cte.c.total_count).label("total_count"))
-        .select_from(filtered_cte)
-        .cte("market_item_totals")
-    )
-    paged_cte = (
-        select(filtered_cte.c.c2c_items_id, filtered_cte.c.row_num)
-        .where(filtered_cte.c.row_num > offset)
-        .where(filtered_cte.c.row_num <= offset + limit)
-        .cte("paged_market_items")
-    )
+        filters.append(C2CItem.updated_at >= cutoff)
 
     with backend.session() as session:
-        rows = session.execute(
-            select(
-                C2CItem,
-                func.coalesce(totals_cte.c.total_count, 0).label("total_count"),
-            )
-            .select_from(totals_cte)
-            .outerjoin(paged_cte, true())
-            .outerjoin(C2CItem, C2CItem.c2c_items_id == paged_cte.c.c2c_items_id)
-            .order_by(paged_cte.c.row_num.asc())
-        ).all()
+        count_stmt = select(func.count()).select_from(C2CItem)
+        page_limit = limit + 1 if is_cloudflare else limit
+        page_stmt = (
+            select(C2CItem)
+            .options(_market_item_list_load_only())
+            .order_by(*order_clauses)
+            .offset(offset)
+            .limit(page_limit)
+        )
+        if filters:
+            count_stmt = count_stmt.where(*filters)
+            page_stmt = page_stmt.where(*filters)
+        if is_cloudflare:
+            fetched_rows = session.scalars(page_stmt).all()
+            has_next_page = len(fetched_rows) > limit
+            rows = fetched_rows[:limit]
+            total_count = offset + len(rows) + (1 if has_next_page else 0)
+        else:
+            total_count = int(session.scalar(count_stmt) or 0)
+            rows = session.scalars(page_stmt).all() if total_count > 0 else []
 
-    total_count = int(rows[0].total_count) if rows else 0
     total_pages = (total_count + limit - 1) // limit if total_count > 0 else 0
 
-    # Batch-fetch listing counts for just this page (separate, simpler query)
-    page_ids = [int(row[0].c2c_items_id) for row in rows if row[0] is not None]
-    listing_counts = get_15d_listing_counts_batch(page_ids) if page_ids else {}
+    page_ids = [int(row.c2c_items_id) for row in rows]
+    # D1 datasets can be hundreds of millions of rows; skip this badge on list views
+    # because it requires product/snapshot aggregation for every page refresh.
+    listing_counts = {} if is_cloudflare else (get_15d_listing_counts_batch(page_ids) if page_ids else {})
 
     details_map = _load_current_details_for_c2c_ids(page_ids) if page_ids else {}
 
     items = []
     for row in rows:
-        if row[0] is None:
-            continue
-        cid = int(row[0].c2c_items_id)
+        cid = int(row.c2c_items_id)
         items.append(
             _market_item_to_dict(
-                row[0],
+                row,
                 listing_counts.get(cid, 0),
                 details_map.get(cid, []),
             )
@@ -864,6 +896,7 @@ def _load_recent_15d_listings_page(
     page = max(1, page)
     offset = (page - 1) * limit
     cutoff = _utc_cutoff(days=15)
+    is_cloudflare = _is_cloudflare_backend()
     items_id_sql = items_id_expr if hasattr(items_id_expr, "label") else literal(items_id_expr)
     sku_id_sql = None
     if sku_id_expr is not None:
@@ -904,51 +937,20 @@ def _load_recent_15d_listings_page(
         C2CItem.drop_reason,
     ).subquery()
     order_clauses = _recent_listing_page_order_clauses(grouped_rows, sort_by)
-    numbered_rows = (
-        select(
-            grouped_rows,
-            func.row_number().over(order_by=order_clauses).label("row_num"),
-            func.count().over().label("total_count"),
-        ).subquery()
-    )
-    totals_cte = (
-        select(func.max(numbered_rows.c.total_count).label("total_count"))
-        .select_from(numbered_rows)
-        .cte("recent_listing_totals")
-    )
-    paged_rows = (
-        select(numbered_rows)
-        .where(numbered_rows.c.row_num > offset)
-        .where(numbered_rows.c.row_num <= offset + limit)
-        .cte("paged_recent_listings")
-    )
 
     with backend.session() as session:
-        rows = session.execute(
-            select(
-                items_id_sql.label("items_id"),
-                func.coalesce(totals_cte.c.total_count, 0).label("total_count"),
-                paged_rows.c.c2c_items_id,
-                paged_rows.c.name,
-                paged_rows.c.show_price,
-                paged_rows.c.show_market_price,
-                paged_rows.c.uface,
-                paged_rows.c.uname,
-                paged_rows.c.created_at,
-                paged_rows.c.updated_at,
-                paged_rows.c.publish_status,
-                paged_rows.c.sale_status,
-                paged_rows.c.drop_reason,
-                paged_rows.c.est_price,
-                paged_rows.c.row_num,
-            )
-            .select_from(totals_cte)
-            .outerjoin(paged_rows, true())
-            .order_by(paged_rows.c.row_num.asc())
-        ).all()
+        page_limit = limit + 1 if is_cloudflare else limit
+        page_stmt = select(grouped_rows).order_by(*order_clauses).offset(offset).limit(page_limit)
+        if is_cloudflare:
+            fetched_rows = session.execute(page_stmt).all()
+            has_next_page = len(fetched_rows) > limit
+            rows = fetched_rows[:limit]
+            total_count = offset + len(rows) + (1 if has_next_page else 0)
+        else:
+            total_count = int(session.scalar(select(func.count()).select_from(grouped_rows)) or 0)
+            rows = session.execute(page_stmt).all() if total_count > 0 else []
 
-    resolved_items_id = int(rows[0].items_id) if rows and rows[0].items_id is not None else None
-    total_count = int(rows[0].total_count) if rows else 0
+    resolved_items_id = int(items_id_expr) if isinstance(items_id_expr, int) else None
     total_pages = (total_count + limit - 1) // limit if total_count > 0 else 0
     listing_ids = [int(row.c2c_items_id) for row in rows if row.c2c_items_id is not None]
     details_map = _load_current_details_for_c2c_ids(listing_ids) if listing_ids else {}
@@ -1015,35 +1017,13 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
         if is_d1_like:
             # D1 remote SQL can time out on full table scans; keep diagnostics lightweight.
             table_rows: List[Dict[str, Any]] = []
-            warnings.append("cloudflare d1 diagnostics use lightweight mode to avoid query timeouts")
+            warnings.append("cloudflare d1 diagnostics omit row counts to avoid full-table scan timeouts")
             for table_name in tables:
                 if table_name.startswith("_cf_") or table_name.startswith("sqlite_"):
                     skipped_tables.append(table_name)
                     continue
-                row_count = 0
+                row_count: Optional[int] = None
                 recent_rows: Optional[int] = None
-                quoted_table = identifier_preparer.quote(table_name)
-                if table_name in {"c2c_items", "c2c_items_snapshot", "product"}:
-                    try:
-                        row_count = int(conn.execute(sa.text(f"SELECT COUNT(*) FROM {quoted_table}")).scalar() or 0)
-                    except Exception:
-                        row_count = 0
-                if table_name == "c2c_items":
-                    try:
-                        recent_rows = int(
-                            conn.execute(
-                                sa.text(
-                                    f"""
-                                    SELECT COUNT(*) FROM {quoted_table}
-                                    WHERE datetime(COALESCE(updated_at, created_at)) >= datetime(:cutoff)
-                                    """
-                                ),
-                                {"cutoff": cutoff},
-                            ).scalar()
-                            or 0
-                        )
-                    except Exception:
-                        recent_rows = None
                 table_rows.append(
                     {
                         "name": table_name,
@@ -1063,8 +1043,8 @@ def get_database_size_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
                 reverse=True,
             )
             top_tables = table_rows[:top_n]
-            total_rows = sum(int(item.get("row_count") or 0) for item in table_rows)
-            recent_total_rows = sum(int(item.get("recent_rows") or 0) for item in table_rows if item.get("recent_rows") is not None)
+            total_rows = None
+            recent_total_rows = None
             return {
                 "generated_at": generated_at,
                 "backend": get_db_backend_name(),
@@ -1751,7 +1731,7 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                 )
             product_upsert_started_at = time.perf_counter()
             _product_cols = 8  # blindbox_id, items_id, sku_id, name, img_url, market_price, created_at, updated_at
-            _product_chunk = _D1_MAX_PARAMS // _product_cols
+            _product_chunk = _D1_PRODUCT_UPSERT_ROWS if is_cloudflare else max(1, _D1_MAX_PARAMS // _product_cols)
             for i in range(0, len(product_upsert_payload), _product_chunk):
                 chunk = product_upsert_payload[i : i + _product_chunk]
                 product_stmt = sqlite_insert(Product).values(chunk)
@@ -1768,15 +1748,29 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             product_upsert_ms = int((time.perf_counter() - product_upsert_started_at) * 1000)
         if c2c_upsert_payload:
             _c2c_cols = 18  # c2c_items_id through updated_at
-            _c2c_chunk = _D1_MAX_PARAMS // _c2c_cols
+            _c2c_chunk = _D1_C2C_UPSERT_ROWS if is_cloudflare else max(1, _D1_MAX_PARAMS // _c2c_cols)
             inserted_ids: set[int] = set()
+            existing_ids_before: set[int] = set()
+            upsert_item_ids = [int(it["c2c_items_id"]) for it in c2c_upsert_payload]
             dialect = str(getattr(backend._engine.dialect, "name", "") or "").lower()
             supports_returning = bool(
                 getattr(backend._engine.dialect, "insert_returning", False)
                 or getattr(backend._engine.dialect, "supports_returning", False)
             )
-            use_returning = supports_returning or dialect in {"sqlite", "cloudflare_d1"}
+            use_returning = False if is_cloudflare else (supports_returning or dialect in {"sqlite", "cloudflare_d1"})
             used_returning = False
+            inserted_detect_started_at = 0.0
+            if is_cloudflare:
+                inserted_detect_started_at = time.perf_counter()
+                for i in range(0, len(upsert_item_ids), _D1_ID_LOOKUP_ROWS):
+                    chunk_ids = upsert_item_ids[i : i + _D1_ID_LOOKUP_ROWS]
+                    existing_ids_before.update(
+                        int(row[0])
+                        for row in session.execute(
+                            select(C2CItem.c2c_items_id).where(C2CItem.c2c_items_id.in_(chunk_ids))
+                        ).all()
+                    )
+                c2c_inserted_detect_mode = "prefetch"
 
             c2c_upsert_started_at = time.perf_counter()
             if use_returning:
@@ -1852,9 +1846,10 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                     )
                     session.execute(c2c_stmt)
             c2c_upsert_ms = int((time.perf_counter() - c2c_upsert_started_at) * 1000)
-            inserted_detect_started_at = time.perf_counter()
-            if not used_returning:
-                upsert_item_ids = [int(it["c2c_items_id"]) for it in c2c_upsert_payload]
+            if is_cloudflare:
+                inserted_ids = set(upsert_item_ids) - existing_ids_before
+            elif not used_returning:
+                inserted_detect_started_at = time.perf_counter()
                 _id_lookup_chunk = max(1, _D1_MAX_PARAMS)
                 verified_inserted_ids: set[int] = set()
                 for i in range(0, len(upsert_item_ids), _id_lookup_chunk):
@@ -1870,6 +1865,8 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                     )
                 inserted_ids = verified_inserted_ids
                 c2c_inserted_detect_mode = "fallback_select"
+            else:
+                inserted_detect_started_at = time.perf_counter()
             c2c_inserted_detect_ms = int((time.perf_counter() - inserted_detect_started_at) * 1000)
             inserted = len(inserted_ids)
             for it in items:
@@ -1892,7 +1889,7 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             product_id_map: Dict[Tuple[int, int, int], int] = {}
             if product_keys_needed:
                 product_keys = list(product_keys_needed)
-                _product_lookup_chunk = max(1, _D1_MAX_PARAMS // 3)
+                _product_lookup_chunk = _D1_PRODUCT_LOOKUP_ROWS if is_cloudflare else max(1, _D1_MAX_PARAMS // 3)
                 for i in range(0, len(product_keys), _product_lookup_chunk):
                     key_chunk = product_keys[i : i + _product_lookup_chunk]
                     product_id_rows = session.execute(
@@ -1922,7 +1919,7 @@ def save_items_data_phase(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                 })
             if snapshot_rows:
                 _snap_cols = 4  # c2c_items_id, snapshot_at, product_id, est_price
-                _snap_chunk = _D1_MAX_PARAMS // _snap_cols
+                _snap_chunk = _D1_SNAPSHOT_INSERT_ROWS if is_cloudflare else max(1, _D1_MAX_PARAMS // _snap_cols)
                 for i in range(0, len(snapshot_rows), _snap_chunk):
                     session.execute(
                         insert(C2CItemSnapshot).values(snapshot_rows[i : i + _snap_chunk])
@@ -1966,26 +1963,39 @@ def flush_pending_blob_updates(
     blob_write_started_at = time.perf_counter()
     with backend.session() as session:
         session.flush()
-        # Use one batched statement for all rows to reduce DB round-trips.
-        # Use hex blob literals for both backends to avoid D1 bytes coercion issues.
-        case_lines: List[str] = []
-        id_literals: List[str] = []
-        for blob_item_id, _, blob_hex in pending_blob_updates:
-            cid = int(blob_item_id)
-            id_literals.append(str(cid))
-            case_lines.append(f"WHEN {cid} THEN X'{blob_hex}'")
-        case_sql = " ".join(case_lines)
-        in_sql = ", ".join(id_literals)
-        stmt = sa.text(
-            f"""
-            UPDATE c2c_items
-            SET detail_blob = CASE c2c_items_id
-            {case_sql}
-            END
-            WHERE c2c_items_id IN ({in_sql})
-            """
-        )
-        session.execute(stmt)
+        # D1 executes over HTTP and has strict per-statement limits; keep each BLOB
+        # write to one row so a page with many bundled items cannot produce a huge CASE SQL.
+        if is_cloudflare:
+            for blob_item_id, _, blob_hex in pending_blob_updates:
+                cid = int(blob_item_id)
+                session.execute(
+                    sa.text(
+                        f"""
+                        UPDATE c2c_items
+                        SET detail_blob = X'{blob_hex}'
+                        WHERE c2c_items_id = {cid}
+                        """
+                    )
+                )
+        else:
+            case_lines: List[str] = []
+            id_literals: List[str] = []
+            for blob_item_id, _, blob_hex in pending_blob_updates:
+                cid = int(blob_item_id)
+                id_literals.append(str(cid))
+                case_lines.append(f"WHEN {cid} THEN X'{blob_hex}'")
+            case_sql = " ".join(case_lines)
+            in_sql = ", ".join(id_literals)
+            stmt = sa.text(
+                f"""
+                UPDATE c2c_items
+                SET detail_blob = CASE c2c_items_id
+                {case_sql}
+                END
+                WHERE c2c_items_id IN ({in_sql})
+                """
+            )
+            session.execute(stmt)
     blob_write_ms = int((time.perf_counter() - blob_write_started_at) * 1000)
     blob_write_count = len(pending_blob_updates)
     _log_blob_write_complete(backend_name, blob_write_count)
@@ -2104,7 +2114,9 @@ def set_metadata(key: str, value: Optional[str]) -> None:
         session.commit()
 
 
-def count_items() -> int:
+def count_items() -> Optional[int]:
+    if _is_cloudflare_backend():
+        return None
     backend = _require_sqlalchemy_backend()
     with backend.session() as session:
         total = session.scalar(select(func.count()).select_from(C2CItem))
@@ -2113,19 +2125,45 @@ def count_items() -> int:
 
 def search_items_by_pattern(pattern: str, limit: int = 50, page: int = 1) -> Tuple[List[Dict[str, Any]], int, int]:
     backend = _require_sqlalchemy_backend()
+    limit = max(1, int(limit or 50))
+    page = max(1, int(page or 1))
+    offset = (page - 1) * limit
+    is_cloudflare = _is_cloudflare_backend()
+    like_pattern = f"%{pattern}%"
     with backend.session() as session:
-        rows = session.scalars(
-            select(C2CItem).order_by(C2CItem.updated_at.desc())
-        ).all()
-    regex = re.compile(pattern)
+        stmt = (
+            select(C2CItem)
+            .options(
+                load_only(
+                    C2CItem.c2c_items_id,
+                    C2CItem.c2c_items_name,
+                    C2CItem.show_price,
+                    C2CItem.show_market_price,
+                    C2CItem.updated_at,
+                )
+            )
+            .where(C2CItem.c2c_items_name.like(like_pattern))
+            .order_by(C2CItem.updated_at.desc(), C2CItem.c2c_items_id.desc())
+        )
+        if is_cloudflare:
+            fetched_rows = session.scalars(stmt.offset(offset).limit(limit + 1)).all()
+            has_next_page = len(fetched_rows) > limit
+            rows = fetched_rows[:limit]
+            total_count = offset + len(rows) + (1 if has_next_page else 0)
+        else:
+            total_count = int(
+                session.scalar(
+                    select(func.count()).select_from(C2CItem).where(C2CItem.c2c_items_name.like(like_pattern))
+                )
+                or 0
+            )
+            rows = session.scalars(stmt.offset(offset).limit(limit)).all() if total_count > 0 else []
     matched: List[Dict[str, Any]] = []
     for row in rows:
         iid = row.c2c_items_id
         name = row.c2c_items_name
         price = row.show_price
         market = row.show_market_price
-        if not regex.search(name or ""):
-            continue
         matched.append(
             {
                 "id": iid,
@@ -2138,13 +2176,8 @@ def search_items_by_pattern(pattern: str, limit: int = 50, page: int = 1) -> Tup
                 ),
             }
         )
-    total_count = len(matched)
-    limit = max(1, limit)
-    page = max(1, page)
     total_pages = (total_count + limit - 1) // limit if total_count > 0 else 0
-    start = (page - 1) * limit
-    end = start + limit
-    return matched[start:end] if start < total_count else [], total_count, total_pages
+    return matched, total_count, total_pages
 
 
 def list_market_items(
@@ -2342,28 +2375,6 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
     backend = _require_sqlalchemy_backend()
     cutoff = _utc_cutoff(days=15)
     current_details = _current_item_details_subquery("product_metadata_current_details")
-    
-    name_sq = (
-        select(current_details.c.name)
-        .where(current_details.c.items_id == items_id)
-        .limit(1)
-        .scalar_subquery()
-    )
-    img_url_sq = (
-        select(current_details.c.img_url)
-        .where(current_details.c.items_id == items_id)
-        .limit(1)
-        .scalar_subquery()
-    )
-    sku_id_sq = (
-        select(current_details.c.sku_id)
-        .where(current_details.c.items_id == items_id)
-        .where(current_details.c.sku_id.is_not(None))
-        .where(current_details.c.sku_id > 0)
-        .order_by(current_details.c.id.asc())
-        .limit(1)
-        .scalar_subquery()
-    )
     stats_sq = (
         select(
             func.min(current_details.c.est_price).label("price_min"),
@@ -2377,30 +2388,41 @@ def get_product_metadata(items_id: int) -> Optional[Dict[str, Any]]:
     )
 
     with backend.session() as session:
+        product_row = session.execute(
+            select(Product.name, Product.img_url, Product.sku_id)
+            .where(Product.items_id == items_id)
+            .where(Product.sku_id > 0)
+            .order_by(Product.id.asc())
+            .limit(1)
+        ).first()
+        if product_row is None:
+            product_row = session.execute(
+                select(Product.name, Product.img_url, Product.sku_id)
+                .where(Product.items_id == items_id)
+                .order_by(Product.id.asc())
+                .limit(1)
+            ).first()
         row = session.execute(
             select(
-                name_sq.label("name"),
-                img_url_sq.label("img_url"),
-                sku_id_sq.label("sku_id"),
                 stats_sq.c.price_min,
                 stats_sq.c.price_max,
                 stats_sq.c.recent_listed_count,
             )
         ).first()
 
-    if row is None or row.name is None:
+    if product_row is None or product_row.name is None:
         return None
 
     price_min = int(row.price_min) if row.price_min is not None else None
     price_max = int(row.price_max) if row.price_max is not None else None
-    sku_id = int(row.sku_id) if row.sku_id is not None else None
+    sku_id = int(product_row.sku_id) if product_row.sku_id is not None and int(product_row.sku_id) > 0 else None
     recent_listed_count = int(row.recent_listed_count) if row.recent_listed_count is not None else 0
 
     return {
         "items_id": items_id,
         "sku_id": sku_id,
-        "name": row.name,
-        "img_url": row.img_url,
+        "name": product_row.name,
+        "img_url": product_row.img_url,
         "price_min": price_min,
         "price_max": price_max,
         "recent_listed_count": recent_listed_count,
@@ -2501,24 +2523,17 @@ def get_market_item_recent_15d_listings(
     limit: int = 20,
     sort_by: str = "TIME_DESC",
 ) -> Tuple[Optional[int], List[Dict[str, Any]], int, int]:
-    current_details = _current_item_details_subquery("market_item_recent_current_details")
-    items_id_sq = (
-        select(current_details.c.items_id)
-        .where(current_details.c.c2c_items_id == c2c_items_id)
-        .order_by(current_details.c.id.asc())
-        .limit(1)
-        .scalar_subquery()
-    )
-    sku_id_sq = (
-        select(current_details.c.sku_id)
-        .where(current_details.c.c2c_items_id == c2c_items_id)
-        .order_by(current_details.c.id.asc())
-        .limit(1)
-        .scalar_subquery()
-    )
+    current_details = _load_current_details_for_c2c_ids([int(c2c_items_id)]).get(int(c2c_items_id), [])
+    if not current_details:
+        return None, [], 0, 0
+    primary_detail = current_details[0]
+    items_id = int(primary_detail.get("itemsId") or 0)
+    if items_id <= 0:
+        return None, [], 0, 0
+    sku_id = int(primary_detail.get("skuId") or 0)
     return _load_recent_15d_listings_page(
-        items_id_expr=items_id_sq,
-        sku_id_expr=sku_id_sq,
+        items_id_expr=items_id,
+        sku_id_expr=sku_id,
         page=page,
         limit=limit,
         sort_by=sort_by,
@@ -2527,20 +2542,22 @@ def get_market_item_recent_15d_listings(
 def get_market_item(c2c_items_id: int) -> Optional[Dict[str, Any]]:
     """Return a single market item by ID."""
     backend = _require_sqlalchemy_backend()
-    recent_count_sq = _market_recent_listing_count_expr()
     with backend.session() as session:
-        row = session.execute(
-            select(
-                C2CItem,
-                func.coalesce(recent_count_sq, 0).label("recent_listed_count"),
-            ).where(C2CItem.c2c_items_id == c2c_items_id)
-        ).first()
-    if row is None or row[0] is None:
+        item = session.scalar(
+            select(C2CItem)
+            .options(_market_item_list_load_only())
+            .where(C2CItem.c2c_items_id == c2c_items_id)
+        )
+    if item is None:
         return None
     details_map = _load_current_details_for_c2c_ids([int(c2c_items_id)])
+    recent_count = 0
+    if not _is_cloudflare_backend():
+        primary_detail = (details_map.get(int(c2c_items_id)) or [{}])[0]
+        recent_count = get_15d_listing_count(int(primary_detail.get("itemsId") or 0))
     return _market_item_to_dict(
-        row[0],
-        int(row.recent_listed_count or 0),
+        item,
+        recent_count,
         details_map.get(int(c2c_items_id), []),
     )
 
@@ -2548,12 +2565,12 @@ def get_market_item(c2c_items_id: int) -> Optional[Dict[str, Any]]:
 def is_item_detail_blob_empty(c2c_items_id: int) -> bool:
     backend = _require_sqlalchemy_backend()
     with backend.session() as session:
-        row = session.scalar(
-            select(C2CItem).where(C2CItem.c2c_items_id == c2c_items_id)
+        detail_blob = session.scalar(
+            select(C2CItem.detail_blob).where(C2CItem.c2c_items_id == c2c_items_id)
         )
-    if row is None:
+    if detail_blob is None:
         return True
-    detail_list = _decode_detail_blob(getattr(row, "detail_blob", None))
+    detail_list = _decode_detail_blob(detail_blob)
     return len(detail_list) == 0
 
 def get_15d_listing_count(items_id: int) -> int:
@@ -2603,10 +2620,27 @@ def save_bili_session(
         row.updated_at = timestamp
 
 
-def list_bili_sessions(status: Optional[str] = "active") -> List[Dict[str, Any]]:
+def list_bili_sessions(status: Optional[str] = "active", *, include_cookies: bool = True) -> List[Dict[str, Any]]:
     backend = _require_sqlalchemy_backend()
     with backend.session() as session:
         stmt = select(BiliSession)
+        if not include_cookies:
+            stmt = stmt.options(
+                load_only(
+                    BiliSession.id,
+                    BiliSession.login_username,
+                    BiliSession.created_by,
+                    BiliSession.status,
+                    BiliSession.fetch_count,
+                    BiliSession.login_at,
+                    BiliSession.last_success_fetch_at,
+                    BiliSession.last_used_at,
+                    BiliSession.last_checked_at,
+                    BiliSession.last_error,
+                    BiliSession.created_at,
+                    BiliSession.updated_at,
+                )
+            )
         if status:
             stmt = stmt.where(BiliSession.status == status)
         stmt = stmt.order_by(
@@ -2614,7 +2648,7 @@ def list_bili_sessions(status: Optional[str] = "active") -> List[Dict[str, Any]]
             BiliSession.id.asc(),
         )
         rows = session.scalars(stmt).all()
-        return [_bili_session_to_dict(row) for row in rows]
+        return [_bili_session_to_dict(row, include_cookies=include_cookies) for row in rows]
 
 
 def load_next_bili_session() -> Dict[str, Any]:

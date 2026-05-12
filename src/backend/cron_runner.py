@@ -40,6 +40,8 @@ _FINALIZE_TASKS: set[asyncio.Task[None]] = set()
 _BLOB_WRITE_TASKS: set[asyncio.Task[None]] = set()
 _BLOB_WRITE_SEMAPHORE: asyncio.Semaphore | None = None
 _BLOB_WRITE_MAX_CONCURRENCY = 10
+_D1_BLOB_WRITE_MAX_CONCURRENCY = 1
+_BLOB_WRITE_CONFIGURED_CONCURRENCY: int | None = None
 _BLOB_ALERT_THRESHOLD = 8
 _DB_WRITE_MAX_ATTEMPTS = 3
 _DB_WRITE_RETRY_BASE_SECONDS = 0.5
@@ -78,6 +80,10 @@ def _mode_log_label(mode: str) -> str:
 
 def _new_trace_id() -> str:
     return uuid.uuid4().hex[:8]
+
+
+def _blob_write_max_concurrency_for_backend(backend_name: str) -> int:
+    return _D1_BLOB_WRITE_MAX_CONCURRENCY if backend_name == "cloudflare" else _BLOB_WRITE_MAX_CONCURRENCY
 
 
 def _cleanup_blob_write_tasks() -> None:
@@ -481,9 +487,10 @@ def _assign_sessions_to_categories(
 
 async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
     """Run one scan round. API stage runs first; DB stage can be deferred."""
-    global _BLOB_WRITE_SEMAPHORE, _BLOB_ALERT_ACTIVE, _BLOB_RUNNING_COUNT
+    global _BLOB_WRITE_SEMAPHORE, _BLOB_ALERT_ACTIVE, _BLOB_RUNNING_COUNT, _BLOB_WRITE_CONFIGURED_CONCURRENCY
     from bsm.settings import load_runtime_config
     from bsm.db import (
+        get_db_backend_name,
         list_bili_sessions,
         save_items_data_phase,
         flush_pending_blob_updates,
@@ -493,8 +500,15 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
     from bsm.notify import load_notifier, send_admin_telegram_alert
 
     _cleanup_blob_write_tasks()
-    if _BLOB_WRITE_SEMAPHORE is None:
-        _BLOB_WRITE_SEMAPHORE = asyncio.Semaphore(_BLOB_WRITE_MAX_CONCURRENCY)
+    db_backend_name = await asyncio.to_thread(get_db_backend_name)
+    blob_write_max_concurrency = _blob_write_max_concurrency_for_backend(db_backend_name)
+    can_reconfigure_blob_semaphore = not _BLOB_WRITE_TASKS and _BLOB_RUNNING_COUNT == 0
+    if _BLOB_WRITE_SEMAPHORE is None or (
+        _BLOB_WRITE_CONFIGURED_CONCURRENCY != blob_write_max_concurrency
+        and can_reconfigure_blob_semaphore
+    ):
+        _BLOB_WRITE_SEMAPHORE = asyncio.Semaphore(blob_write_max_concurrency)
+        _BLOB_WRITE_CONFIGURED_CONCURRENCY = blob_write_max_concurrency
 
     cfg = await asyncio.to_thread(load_runtime_config)
     interval = float(cfg.get("interval", 20) or 20)
@@ -556,7 +570,7 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
 
     async def _finalize_scan_round(category_jobs: list[dict[str, object]]) -> dict[str, object]:
         db_results: dict[tuple[str | None, int], dict[str, object]] = {}
-        db_tasks: list[asyncio.Task[tuple[tuple[str | None, int], dict[str, object]]]] = []
+        db_jobs: list[dict[str, object]] = []
 
         async def _run_db_pipeline_for_job(job: dict[str, object]) -> tuple[tuple[str | None, int], dict[str, object]]:
             category = job.get("category")
@@ -618,11 +632,17 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
         for job in category_jobs:
             if str(job.get("error") or "").strip():
                 continue
-            db_tasks.append(asyncio.create_task(_run_db_pipeline_for_job(job)))
+            db_jobs.append(job)
 
-        if db_tasks:
-            for key, result in await asyncio.gather(*db_tasks):
-                db_results[key] = result
+        if db_jobs:
+            if db_backend_name == "cloudflare":
+                for job in db_jobs:
+                    key, result = await _run_db_pipeline_for_job(job)
+                    db_results[key] = result
+            else:
+                db_tasks = [asyncio.create_task(_run_db_pipeline_for_job(job)) for job in db_jobs]
+                for key, result in await asyncio.gather(*db_tasks):
+                    db_results[key] = result
 
         total_count = 0
         total_saved = 0
@@ -707,16 +727,19 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
                     async with _BLOB_WRITE_SEMAPHORE:
                         _BLOB_RUNNING_COUNT += 1
                         running_now = _BLOB_RUNNING_COUNT
+                        configured_blob_concurrency = (
+                            _BLOB_WRITE_CONFIGURED_CONCURRENCY or _BLOB_WRITE_MAX_CONCURRENCY
+                        )
                         if running_now >= _BLOB_ALERT_THRESHOLD and not _BLOB_ALERT_ACTIVE:
                             _BLOB_ALERT_ACTIVE = True
                             warn_message = (
                                 "系统告警\n"
                                 "类型: BLOB写入并发预警\n"
-                                f"详情: 当前并发任务 {running_now}/{_BLOB_WRITE_MAX_CONCURRENCY}，阈值 {_BLOB_ALERT_THRESHOLD}"
+                                f"详情: 当前并发任务 {running_now}/{configured_blob_concurrency}，阈值 {_BLOB_ALERT_THRESHOLD}"
                             )
                             asyncio.create_task(asyncio.to_thread(send_admin_telegram_alert, warn_message, cfg))
                             _log_exec(
-                                f"BLOB并发达到告警阈值 | 当前并发任务 {running_now}/{_BLOB_WRITE_MAX_CONCURRENCY}",
+                                f"BLOB并发达到告警阈值 | 当前并发任务 {running_now}/{configured_blob_concurrency}",
                                 level="warn",
                             )
                         try:
@@ -732,8 +755,11 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
                         finally:
                             _BLOB_RUNNING_COUNT = max(0, _BLOB_RUNNING_COUNT - 1)
 
-                blob_task = asyncio.create_task(
-                    _run_blob_write(
+                if blob_is_cloudflare:
+                    _log_exec(
+                        f"BLOB写入开始 | 分类 {_category_label(category)} | 第 {page} 页 | 条数 {blob_write_count} | 运行并发 {_BLOB_RUNNING_COUNT}/{_BLOB_WRITE_CONFIGURED_CONCURRENCY or _BLOB_WRITE_MAX_CONCURRENCY} | 追踪ID {trace_id}"
+                    )
+                    await _run_blob_write(
                         category,
                         page,
                         trace_id,
@@ -741,13 +767,23 @@ async def _run_scan_once(defer_db_finalize: bool = False) -> dict[str, object]:
                         blob_backend_name,
                         blob_is_cloudflare,
                     )
-                )
-                _BLOB_WRITE_TASKS.add(blob_task)
-                blob_task.add_done_callback(lambda t: _BLOB_WRITE_TASKS.discard(t))
-                blob_queued = len(_BLOB_WRITE_TASKS)
-                _log_exec(
-                    f"BLOB写入已排队 | 分类 {_category_label(category)} | 第 {page} 页 | 条数 {blob_write_count} | 队列任务 {blob_queued} | 运行并发 {_BLOB_RUNNING_COUNT}/{_BLOB_WRITE_MAX_CONCURRENCY} | 追踪ID {trace_id}"
-                )
+                else:
+                    blob_task = asyncio.create_task(
+                        _run_blob_write(
+                            category,
+                            page,
+                            trace_id,
+                            pending_blob_updates,
+                            blob_backend_name,
+                            blob_is_cloudflare,
+                        )
+                    )
+                    _BLOB_WRITE_TASKS.add(blob_task)
+                    blob_task.add_done_callback(lambda t: _BLOB_WRITE_TASKS.discard(t))
+                    blob_queued = len(_BLOB_WRITE_TASKS)
+                    _log_exec(
+                        f"BLOB写入已排队 | 分类 {_category_label(category)} | 第 {page} 页 | 条数 {blob_write_count} | 队列任务 {blob_queued} | 运行并发 {_BLOB_RUNNING_COUNT}/{_BLOB_WRITE_CONFIGURED_CONCURRENCY or _BLOB_WRITE_MAX_CONCURRENCY} | 追踪ID {trace_id}"
+                    )
 
             # Repeat detection should use persisted rows, not raw API rows.
             # Raw payload may include malformed/unpersistable entries.
@@ -930,7 +966,7 @@ def _apply_scan_result(
 
 async def cron_loop() -> None:
     """Async cron loop — runs forever until cancelled."""
-    global _CRON_LOOP, _SCAN_NOW_EVENT, _FINALIZE_RESULT_QUEUE, _BLOB_WRITE_SEMAPHORE, _BLOB_ALERT_ACTIVE, _BLOB_RUNNING_COUNT
+    global _CRON_LOOP, _SCAN_NOW_EVENT, _FINALIZE_RESULT_QUEUE, _BLOB_WRITE_SEMAPHORE, _BLOB_ALERT_ACTIVE, _BLOB_RUNNING_COUNT, _BLOB_WRITE_CONFIGURED_CONCURRENCY
 
     cron_state.is_running = True
     _CRON_LOOP = asyncio.get_running_loop()
@@ -1021,6 +1057,7 @@ async def cron_loop() -> None:
     _SCAN_NOW_EVENT = None
     _FINALIZE_RESULT_QUEUE = None
     _BLOB_WRITE_SEMAPHORE = None
+    _BLOB_WRITE_CONFIGURED_CONCURRENCY = None
     _BLOB_ALERT_ACTIVE = False
     _BLOB_RUNNING_COUNT = 0
     _reset_session_cache()

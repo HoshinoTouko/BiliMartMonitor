@@ -44,7 +44,7 @@ interface LogLine {
 
 interface DbSizeTableRow {
     name: string;
-    row_count: number;
+    row_count: number | null;
     recent_rows: number | null;
     table_bytes: number | null;
     index_bytes: number | null;
@@ -57,8 +57,8 @@ interface DbSizeReport {
     dialect: string;
     days_window: number;
     table_count: number;
-    total_rows: number;
-    recent_total_rows: number;
+    total_rows: number | null;
+    recent_total_rows: number | null;
     total_db_bytes: number | null;
     used_db_bytes: number | null;
     free_db_bytes: number | null;
@@ -965,7 +965,7 @@ export default function SystemSettingsPage() {
                             </div>
                             <div className="bsm-stat-card">
                                 <span className="bsm-stat-label">最近 {dbSize.days_window} 天新增行</span>
-                                <span className="bsm-stat-value" style={{ fontSize: "1rem" }}>{dbSize.recent_total_rows}</span>
+                                <span className="bsm-stat-value" style={{ fontSize: "1rem" }}>{dbSize.recent_total_rows ?? "—"}</span>
                             </div>
                         </div>
                         <div className="bsm-text-muted" style={{ fontSize: "0.8rem", marginBottom: "0.625rem" }}>
@@ -996,7 +996,7 @@ export default function SystemSettingsPage() {
                                     ) : dbSize.tables.map((row) => (
                                         <tr key={row.name}>
                                             <td>{row.name}</td>
-                                            <td>{row.row_count}</td>
+                                            <td>{row.row_count ?? "—"}</td>
                                             <td>{row.recent_rows ?? "—"}</td>
                                             <td>{formatBytes(row.table_bytes)}</td>
                                             <td>{formatBytes(row.index_bytes)}</td>

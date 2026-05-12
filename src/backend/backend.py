@@ -20,7 +20,7 @@ from bsm.api import get_current_login_username, get_login_key_and_url, verify_lo
 
 
 def list_bili_sessions() -> List[Dict[str, Any]]:
-    sessions = db.list_bili_sessions(status=None)
+    sessions = db.list_bili_sessions(status=None, include_cookies=False)
     result: List[Dict[str, Any]] = []
     for session in sessions:
         result.append(

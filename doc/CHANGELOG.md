@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.9.5.8] — 2026-05-12
+
+### Performance
+
+- **D1 Market List Query Boundaries**: Reworked market list reads so Cloudflare D1 uses narrow `LIMIT + 1` page queries instead of windowed total-count queries. List views no longer select `detail_blob`, and D1 list responses skip per-page listing-count aggregation that can fan out into snapshot scans.
+- **D1 Hot Path Indexes**: Added Alembic revision `0002_d1_performance_indexes` for market ordering, category filtering, product lookup, snapshot lookup, access-user listing, and Bili session listing. The migration also removes obsolete `c2c_items` indexes that no longer match current ordering.
+- **D1 Write Query Size**: Reduced D1 write statement size for product, C2C item, product lookup, and snapshot chunks. Inserted-item detection now uses a small primary-key prefetch on D1 instead of relying on `RETURNING`.
+- **D1 Write Contention**: Serialized scan DB finalization and BLOB flushes for Cloudflare D1 so concurrent category scans do not pile multiple write batches onto the same remote SQLite database.
+
+### Fixed
+
+- **Admin Session Reads**: Admin session list responses can omit the `cookies` column, avoiding unnecessary large-field reads for UI-only session summaries.
+- **Docker Build Compatibility**: Standard Docker builds now use the Node.js 22 path required by the current frontend toolchain and avoid the Node.js 20 / pnpm `node:sqlite` failure mode.
+
+### Changed
+
+- **Backend App Version**: Updated FastAPI app version to `0.9.5.8`.
+- **Frontend Version Bump**: Updated frontend/app version to `0.9.5.8`.
+- **D1 Diagnostics**: Lightweight D1 database-size diagnostics now omit full table row counts rather than scanning large tables remotely.
+
+### Tests
+
+- Added regression coverage that market list SQL omits `detail_blob`, admin session summaries omit `cookies`, D1 inserted detection uses prefetch mode, and Alembic head records `0002_d1_performance_indexes`.
+- Verified:
+  - `./scripts/run-tests.sh` (188 passed)
+  - `pnpm --dir src/frontend lint`
+  - `pnpm --dir src/frontend build`
+
 ## [0.9.5.7] — 2026-03-12
 
 ### Fixed

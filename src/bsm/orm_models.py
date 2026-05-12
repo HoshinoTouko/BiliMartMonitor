@@ -12,6 +12,9 @@ class Base(DeclarativeBase):
 
 class AccessUser(Base):
     __tablename__ = "access_users"
+    __table_args__ = (
+        Index("idx_access_users_status_created_id_username", "status", "created_at", "id", "username"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
@@ -47,6 +50,9 @@ class AccessUser(Base):
 
 class BiliSession(Base):
     __tablename__ = "bili_sessions"
+    __table_args__ = (
+        Index("idx_bili_sessions_status_last_used_created_id", "status", "last_used_at", "created_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     login_username: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
@@ -78,6 +84,12 @@ class BiliSession(Base):
 
 class C2CItem(Base):
     __tablename__ = "c2c_items"
+    __table_args__ = (
+        Index("idx_c2c_items_created_updated_id", "created_at", "updated_at", "c2c_items_id"),
+        Index("idx_c2c_items_category_created_updated_id", "category_id", "created_at", "updated_at", "c2c_items_id"),
+        Index("idx_c2c_items_price_created_id", "price", "created_at", "c2c_items_id"),
+        Index("idx_c2c_items_updated_id", "updated_at", "c2c_items_id"),
+    )
 
     c2c_items_id: Mapped[int] = mapped_column(primary_key=True)
     category_id: Mapped[Optional[str]] = mapped_column(Text)
@@ -117,6 +129,7 @@ class Product(Base):
     __table_args__ = (
         UniqueConstraint("blindbox_id", "items_id", "sku_id", name="uq_product_triple"),
         Index("idx_product_items_sku", "items_id", "sku_id"),
+        Index("idx_product_sku_items", "sku_id", "items_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -148,7 +161,9 @@ class C2CItemSnapshot(Base):
     __tablename__ = "c2c_items_snapshot"
     __table_args__ = (
         Index("idx_c2c_snapshot_c2c_at", "c2c_items_id", "snapshot_at"),
+        Index("idx_c2c_snapshot_c2c_product_at", "c2c_items_id", "product_id", "snapshot_at"),
         Index("idx_c2c_snapshot_product_id", "product_id"),
+        Index("idx_c2c_snapshot_product_at_c2c", "product_id", "snapshot_at", "c2c_items_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -171,6 +186,3 @@ class SystemMetadata(Base):
     updated_at: Mapped[Optional[str]] = mapped_column(
         Text, server_default=text("CURRENT_TIMESTAMP")
     )
-
-
-Index("idx_c2c_items_updated_at", C2CItem.updated_at)

@@ -7,7 +7,7 @@
 - Next.js 前端
 - 支持 SQLite / Cloudflare D1 双数据库后端
 
-当前版本：`0.9.0`
+当前版本：`0.9.5.8`
 
 ## 功能概览
 
@@ -130,6 +130,20 @@ PYTHONPATH=src ./.venv/bin/alembic upgrade head
 - 为旧版 `access_users` / `bili_sessions` 补齐缺失列
 - 将旧版 `user_sessions` 数据迁移到 `bili_sessions`
 - 在 SQLite 上修复 `bili_sessions.created_by -> access_users.username` 的外键约束
+- 为 Cloudflare D1 热路径补齐索引，覆盖市场列表排序、商品快照查询、账号列表和 Bili Session 列表
+
+Cloudflare D1 线上库升级建议先暂停后台扫描，再执行迁移，避免建索引时和扫描写入互相抢占：
+
+```bash
+PYTHONPATH=src ./.venv/bin/alembic upgrade head
+```
+
+如果线上库已经手动创建过表，但还没有 Alembic 版本记录，先标记初始版本再升级：
+
+```bash
+PYTHONPATH=src ./.venv/bin/alembic stamp 0001_init
+PYTHONPATH=src ./.venv/bin/alembic upgrade head
+```
 
 ## 运行配置
 
@@ -176,7 +190,7 @@ bili_session_cooldown_seconds: 60
 当前已发布镜像：
 
 ```bash
-docker pull hoshinotouko/bilimartmonitor:0.9.0
+docker pull hoshinotouko/bilimartmonitor:0.9.5.8
 ```
 
 ### 标准 Docker
@@ -186,6 +200,8 @@ docker pull hoshinotouko/bilimartmonitor:0.9.0
 ```bash
 docker build -t bilimart-monitor .
 ```
+
+Docker 构建阶段使用 Node.js 22。Next.js 16 / 新版 pnpm 不再适合 Node.js 20 构建环境，旧 builder 镜像可能在 `pnpm config` 阶段报 `node:sqlite` 相关错误。
 
 使用本地 `.env` 与 `config.yaml` 启动：
 
@@ -206,7 +222,7 @@ docker run --rm -it \
   --env-file .env \
   -v "$(pwd)/config.yaml:/app/config.yaml" \
   -v "$(pwd)/data:/app/data" \
-  hoshinotouko/bilimartmonitor:0.9.0
+  hoshinotouko/bilimartmonitor:0.9.5.8
 ```
 
 说明：
